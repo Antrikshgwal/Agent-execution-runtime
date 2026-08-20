@@ -10,3 +10,6 @@ __pycache__/
 
 # Environment
 .env
+specs.md
+# Local design notes, not shared
+specs.md
