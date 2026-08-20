@@ -19,8 +19,14 @@ create table if not exists journal_events (
     created_at    timestamptz not null default now(),
     confirmed_at  timestamptz,
     epoch         integer not null default 0,
+    llm_attempts  integer not null default 0,  -- planner calls spent on this step
     primary key (run_id, seq)
 );
+
+-- Kept separate so an existing database picks the column up. A real provider
+-- has no call counter to read after a crash, so the count lives here.
+alter table journal_events
+    add column if not exists llm_attempts integer not null default 0;
 
 create table if not exists side_effects (
     idempotency_key  text primary key,  -- '<run_id>:<seq>', e.g. 'run42:3'

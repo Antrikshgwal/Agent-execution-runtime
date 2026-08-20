@@ -28,11 +28,33 @@ decided.
 
 ## Run it
 
-Start Postgres and both mocks as described in `mock/README.md`, then:
+```bash
+pip install -r requirements.txt
+```
+
+Start Postgres and the mock cloud as described in `mock/README.md`, then pick a
+planner.
+
+**Scripted planner** (default). Free, deterministic, and what the crash tests
+use. Needs `mock_llm` running:
 
 ```bash
 python runtime.py
 ```
+
+**Gemini.** Put `GEMINI_API_KEY=...` in `.env.local`, which git ignores:
+
+```bash
+PLANNER=gemini python runtime.py
+```
+
+`GEMINI_MODEL` overrides the default `gemini-3.5-flash`. A real model makes
+replay more than a demonstration: ask it twice about the same step and the
+second answer may differ.
+
+Planner calls are counted in `journal_events.llm_attempts`, incremented before
+each call. Counting in the database rather than at the provider means the number
+survives `kill -9` and reflects money spent rather than answers received.
 
 ## Crash tests
 

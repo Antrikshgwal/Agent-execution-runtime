@@ -67,6 +67,19 @@ def describe(decision: dict[str, Any]) -> str:
     return "DONE" if decision.get("done") else decision["tool_name"]
 
 
+async def llm_calls(conn: asyncpg.Connection, run_id: str) -> int:
+    """Planner calls this run has spent, counted in the database.
+
+    Incremented before each call, so it survives a crash mid-call and reflects
+    money spent rather than answers received. A real provider offers nothing
+    equivalent to read after a restart.
+    """
+    return await conn.fetchval(
+        "select coalesce(sum(llm_attempts), 0) from journal_events where run_id = $1",
+        run_id,
+    )
+
+
 # --------------------------------------------------------------------------
 # journal
 # --------------------------------------------------------------------------
@@ -124,7 +137,7 @@ async def decide_step(
             seq=seq,
             tool=describe(decision),
             args=json.dumps(decision.get("tool_args", {})),
-            llm_calls=await planner.call_count(),
+            llm_calls=await llm_calls(conn, run_id),
         )
         return decision
 
@@ -143,7 +156,14 @@ async def decide_step(
     # Nothing exists to replay, so this step gets decided again. It costs one
     # call, and correctness holds because nobody acted on the lost answer.
 
-    log("deciding", run=run_id, seq=seq)
+    # Count the attempt before making it. A crash during the call still leaves
+    # the spend recorded.
+    await conn.execute(
+        "update journal_events set llm_attempts = llm_attempts + 1 where run_id = $1 and seq = $2",
+        run_id,
+        seq,
+    )
+    log("deciding", run=run_id, seq=seq, llm_calls=await llm_calls(conn, run_id))
     history = await load_history(conn, run_id)
     decision = await planner.decide(GOAL, history, tools.schemas_for_model())
 
@@ -172,7 +192,7 @@ async def decide_step(
         seq=seq,
         tool=describe(decision),
         args=json.dumps(decision.get("tool_args", {})),
-        llm_calls=await planner.call_count(),
+        llm_calls=await llm_calls(conn, run_id),
     )
 
     crash("after_decide")
@@ -286,7 +306,7 @@ async def recover(conn: asyncpg.Connection, run_id: str, epoch: int) -> tuple[se
     settled: set[int] = set()
     blocked: set[int] = set()
     reconciled = 0
-    calls_before = await planner.call_count()
+    calls_before = await llm_calls(conn, run_id)
 
     banner(f"RECOVERY run={run_id} epoch={epoch}")
     jcounts = {"intent": 0, "confirmed": 0}
@@ -358,7 +378,7 @@ async def recover(conn: asyncpg.Connection, run_id: str, epoch: int) -> tuple[se
         settled.add(seq)
         reconciled += 1
 
-    calls_after = await planner.call_count()
+    calls_after = await llm_calls(conn, run_id)
     print(
         f"  llm_calls before={calls_before} after={calls_after}"
         f"  ({'unchanged' if calls_before == calls_after else 'CHANGED'})",
@@ -384,7 +404,7 @@ async def main() -> None:
         )
         epoch = await conn.fetchval("select epoch from runs where run_id = $1", RUN_ID)
 
-        log("registry", tools=",".join(tools.REGISTRY))
+        log("registry", tools=",".join(tools.REGISTRY), planner=planner.BACKEND)
         settled, blocked = await recover(conn, RUN_ID, epoch)
 
         for seq in range(MAX_STEPS):
@@ -405,7 +425,7 @@ async def main() -> None:
                     RUN_ID,
                     epoch,
                 )
-                log("done", run=RUN_ID, steps=seq, llm_calls=await planner.call_count())
+                log("done", run=RUN_ID, steps=seq, llm_calls=await llm_calls(conn, RUN_ID))
                 return
 
             if seq in settled:
