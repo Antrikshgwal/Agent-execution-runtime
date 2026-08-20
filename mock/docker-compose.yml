@@ -1,4 +1,4 @@
-name: durable-mock
+name: durable-agent-execution-runtime
 
 services:
   postgres:
