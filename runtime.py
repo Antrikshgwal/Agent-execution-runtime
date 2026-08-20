@@ -1,12 +1,11 @@
 """Intent-first tool execution with crash recovery.
 
-Phase 3: the runtime writes a committed intent row before every tool call and
-confirms after, and on startup resolves any row left in the unknown window by
-re-sending with the same idempotency key.
+The runtime writes a committed intent row before every tool call and confirms
+after, and on startup it resolves any row left in the unknown window by
+re-sending under the same idempotency key.
 
-The plan below stands in for the LLM's decisions until phase 5 journals them.
-Tool names and arguments are opaque here -- the runtime passes them through and
-stores whatever the remote returns.
+Tools arrive through the registry. The plan below stands in for the LLM's
+decisions until phase 5 journals them.
 """
 
 import asyncio
@@ -17,12 +16,13 @@ from datetime import datetime, timezone
 from typing import Any
 
 import asyncpg
-import httpx
+
+import demo_tools  # noqa: F401  (importing registers the demo tools)
+import tools
 
 DATABASE_URL = os.environ.get(
     "DATABASE_URL", "postgresql://durable:durable@localhost:5433/durable"
 )
-MOCK_CLOUD_URL = os.environ.get("MOCK_CLOUD_URL", "http://localhost:9000")
 
 RUN_ID = os.environ.get("RUN_ID", "run1")
 GOAL = "stand up a web service"
@@ -31,12 +31,12 @@ GOAL = "stand up a web service"
 # which is what the idempotency key is derived from.
 PLAN: list[tuple[str, dict[str, Any]]] = [
     ("create_server", {"name": "srv-231", "spec": "t3.micro"}),
-    ("create_database", {"name": "app-db", "spec": "pg16-small"}),
-    ("create_dns_record", {"name": "app.example.com", "spec": "A"}),
+    ("create_database", {"name": "app-db", "engine": "postgres", "size_gb": 20}),
+    ("create_dns_record", {"hostname": "app.example.com", "record_type": "A", "target": "srv-231"}),
 ]
 
-# Hard-kill injection. Phase 6 builds the crash test suite around these names;
-# the point of setting them here is that the crashing path and the normal path
+# Hard-kill injection. Phase 6 builds the crash test suite around these names.
+# The point of setting them here is that the crashing path and the normal path
 # are the same path.
 CRASH_AT = os.environ.get("CRASH_AT")
 
@@ -63,34 +63,15 @@ def crash(point: str) -> None:
 
 def key_for(run_id: str, seq: int) -> str:
     """An agent may call the same tool with the same args at two steps. Only the
-    step number distinguishes them, and it survives a crash in the journal."""
+    step number separates them, and it survives a crash in the journal."""
     return f"{run_id}:{seq}"
-
-
-async def send_to_tool(
-    run_id: str, seq: int, tool_name: str, tool_args: dict[str, Any], attempt: int
-) -> tuple[str, str]:
-    idempotency_key = key_for(run_id, seq)
-    log("calling", run=run_id, seq=seq, key=idempotency_key, attempt=attempt)
-
-    async with httpx.AsyncClient() as client:
-        response = await client.post(
-            f"{MOCK_CLOUD_URL}/provision",
-            json={
-                "tool_name": tool_name,
-                "tool_args": tool_args,
-                "idempotency_key": idempotency_key,
-            },
-        )
-    body = response.json()
-    return body["result"], body["status"]
 
 
 async def write_confirm(
     conn: asyncpg.Connection, idempotency_key: str, result: str, epoch: int
 ) -> None:
     """Guarded by epoch and by status, so a superseded worker matches zero rows
-    rather than overwriting the owner's state."""
+    instead of overwriting the owner's state."""
     tag = await conn.execute(
         """
         update side_effects
@@ -118,10 +99,15 @@ async def run_step(
 ) -> None:
     idempotency_key = key_for(run_id, seq)
 
+    # Validate before the intent row exists. A malformed decision fails here,
+    # where it cannot cause a side effect.
+    entry = tools.get(tool_name)
+    entry.validate(tool_args)
+
     crash("before_intent")
 
-    # Intent commits before any network call. Its absence later is proof that no
-    # call was made; its presence means the outcome is unknown, not that it failed.
+    # Intent commits before any network call. Its absence later proves nobody
+    # made the call; its presence means the outcome is unknown.
     await conn.execute(
         """
         insert into side_effects
@@ -139,7 +125,8 @@ async def run_step(
 
     crash("after_intent")
 
-    result, remote = await send_to_tool(run_id, seq, tool_name, tool_args, attempt=1)
+    log("calling", run=run_id, seq=seq, key=idempotency_key, attempt=1)
+    result, remote = await tools.dispatch(tool_name, tool_args, idempotency_key)
 
     crash("after_call")
 
@@ -149,11 +136,25 @@ async def run_step(
     crash("after_confirm")
 
 
+async def flag(conn: asyncpg.Connection, idempotency_key: str, epoch: int) -> None:
+    await conn.execute(
+        """
+        update side_effects
+           set status = 'flagged'
+         where idempotency_key = $1
+           and epoch = $2
+           and status = 'intent'
+        """,
+        idempotency_key,
+        epoch,
+    )
+
+
 async def recover(conn: asyncpg.Connection, run_id: str, epoch: int) -> tuple[set[int], set[int]]:
     """Resolve every row left in the unknown window.
 
-    Returns (settled, blocked): steps that need no further work, and steps a
-    human has to resolve before the run may continue.
+    Returns the steps needing no further work, and the steps a human has to
+    resolve before the run may continue.
     """
     rows = await conn.fetch(
         "select * from side_effects where run_id = $1 order by seq",
@@ -177,31 +178,47 @@ async def recover(conn: asyncpg.Connection, run_id: str, epoch: int) -> tuple[se
     for row in rows:
         seq = row["seq"]
         idempotency_key = row["idempotency_key"]
+        tool_name = row["tool_name"]
 
         if row["status"] == "confirmed":
-            # Already done and recorded. Skip. Do not call.
             settled.add(seq)
             continue
 
         if row["status"] == "flagged":
             print(
-                f"  FLAGGED key={idempotency_key} tool={row['tool_name']}"
+                f"  FLAGGED key={idempotency_key} tool={tool_name}"
                 f" args={row['tool_args']} created_at={row['created_at']}"
-                "  -- needs a human",
+                "  (needs a human)",
                 flush=True,
             )
             blocked.add(seq)
             continue
 
-        # status == 'intent': the outcome is unknown. Re-sending is safe because
-        # the key is the same one the lost attempt used, so the remote either
-        # performs the work for the first time or replays its stored result.
+        # status == 'intent': the outcome is unknown.
+        if not tools.get(tool_name).supports_idempotency_key:
+            # No key means no safe retry. A second attempt could create a second
+            # resource, and no request distinguishes a lost response from a lost
+            # request. Hand it to a human instead.
+            await flag(conn, idempotency_key, epoch)
+            log("flagged", key=idempotency_key, reason="remote has no idempotency key")
+            print(
+                f"  FLAGGED key={idempotency_key} tool={tool_name}"
+                f" args={row['tool_args']} created_at={row['created_at']}"
+                "  (needs a human)",
+                flush=True,
+            )
+            blocked.add(seq)
+            continue
+
+        # Re-sending is safe: the key matches the lost attempt, so the remote
+        # either performs the work for the first time or replays its result.
         print(
             f"  reconcile key={idempotency_key} status=intent -> re-sending with same key",
             flush=True,
         )
-        result, remote = await send_to_tool(
-            run_id, seq, row["tool_name"], json.loads(row["tool_args"]), attempt=2
+        log("calling", run=run_id, seq=seq, key=idempotency_key, attempt=2)
+        result, remote = await tools.dispatch(
+            tool_name, json.loads(row["tool_args"]), idempotency_key
         )
         await write_confirm(conn, idempotency_key, result, epoch)
         log("confirmed", run=run_id, seq=seq, key=idempotency_key, result=result, remote=remote)
@@ -230,11 +247,18 @@ async def main() -> None:
         )
         epoch = await conn.fetchval("select epoch from runs where run_id = $1", RUN_ID)
 
+        log("registry", tools=",".join(tools.REGISTRY))
+
         settled, blocked = await recover(conn, RUN_ID, epoch)
 
         for seq, (tool_name, tool_args) in enumerate(PLAN):
             if seq in blocked:
                 log("blocked", run=RUN_ID, seq=seq, reason="flagged step needs a human")
+                await conn.execute(
+                    "update runs set status = 'failed' where run_id = $1 and epoch = $2",
+                    RUN_ID,
+                    epoch,
+                )
                 break
             if seq in settled:
                 log("skipped", run=RUN_ID, seq=seq, reason="already confirmed")
