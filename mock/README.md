@@ -20,7 +20,7 @@ docker compose up -d
 ## 2. Load the schema
 
 ```bash
-psql postgresql://durable:durable@localhost:5432/durable -f schema.sql
+psql postgresql://durable:durable@localhost:5433/durable -f schema.sql
 ```
 
 ## 3. Start the mock cloud service

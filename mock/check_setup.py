@@ -4,7 +4,7 @@ import sys
 import asyncpg
 import httpx
 
-DATABASE_URL = "postgresql://durable:durable@localhost:5432/durable"
+DATABASE_URL = "postgresql://durable:durable@localhost:5433/durable"
 MOCK_CLOUD_URL = "http://localhost:9000"
 
 
