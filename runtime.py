@@ -1,11 +1,11 @@
-"""Intent-first tool execution with crash recovery.
+"""A durable agent loop.
 
-The runtime writes a committed intent row before every tool call and confirms
-after, and on startup it resolves any row left in the unknown window by
-re-sending under the same idempotency key.
+Each step asks the planner what to do, journals the answer, then runs the chosen
+tool under an idempotency key derived from the step number. Both external actions
+follow the same three-step pattern: commit an intent row, act, commit a confirm.
 
-Tools arrive through the registry. The plan below stands in for the LLM's
-decisions until phase 5 journals them.
+On restart the runtime replays journaled decisions instead of asking again, and
+re-sends stranded tool calls under their original keys.
 """
 
 import asyncio
@@ -18,6 +18,7 @@ from typing import Any
 import asyncpg
 
 import demo_tools  # noqa: F401  (importing registers the demo tools)
+import planner
 import tools
 
 DATABASE_URL = os.environ.get(
@@ -25,15 +26,10 @@ DATABASE_URL = os.environ.get(
 )
 
 RUN_ID = os.environ.get("RUN_ID", "run1")
-GOAL = "stand up a web service"
+GOAL = os.environ.get("GOAL", "stand up a web service")
 
-# Stand-in for journaled LLM decisions. Position in this list is the step's seq,
-# which is what the idempotency key is derived from.
-PLAN: list[tuple[str, dict[str, Any]]] = [
-    ("create_server", {"name": "srv-231", "spec": "t3.micro"}),
-    ("create_database", {"name": "app-db", "engine": "postgres", "size_gb": 20}),
-    ("create_dns_record", {"hostname": "app.example.com", "record_type": "A", "target": "srv-231"}),
-]
+# Guard against a planner that never says DONE.
+MAX_STEPS = 12
 
 # Hard-kill injection. Phase 6 builds the crash test suite around these names.
 # The point of setting them here is that the crashing path and the normal path
@@ -65,6 +61,127 @@ def key_for(run_id: str, seq: int) -> str:
     """An agent may call the same tool with the same args at two steps. Only the
     step number separates them, and it survives a crash in the journal."""
     return f"{run_id}:{seq}"
+
+
+def describe(decision: dict[str, Any]) -> str:
+    return "DONE" if decision.get("done") else decision["tool_name"]
+
+
+# --------------------------------------------------------------------------
+# journal
+# --------------------------------------------------------------------------
+
+
+async def load_history(conn: asyncpg.Connection, run_id: str) -> list[dict[str, Any]]:
+    """Rebuild what the agent knows from committed rows.
+
+    In-memory history is never authoritative. Everything the planner sees comes
+    back out of the journal, joined to the results its tool calls produced.
+    """
+    decisions = await conn.fetch(
+        """
+        select seq, payload from journal_events
+         where run_id = $1 and status = 'confirmed' and event_type = 'decision'
+         order by seq
+        """,
+        run_id,
+    )
+    results = {
+        row["seq"]: row["result"]
+        for row in await conn.fetch(
+            "select seq, result from side_effects where run_id = $1 and status = 'confirmed'",
+            run_id,
+        )
+    }
+
+    history = []
+    for row in decisions:
+        entry: dict[str, Any] = {"seq": row["seq"], "decision": json.loads(row["payload"])}
+        if row["seq"] in results:
+            entry["result"] = results[row["seq"]]
+        history.append(entry)
+    return history
+
+
+async def decide_step(
+    conn: asyncpg.Connection, run_id: str, seq: int, epoch: int
+) -> dict[str, Any]:
+    """Return this step's decision, replaying it when the journal already holds one."""
+    row = await conn.fetchrow(
+        "select event_type, payload, status from journal_events where run_id = $1 and seq = $2",
+        run_id,
+        seq,
+    )
+
+    if row is not None and row["status"] == "confirmed":
+        # The outcome is known because we wrote it down. Replay it and leave the
+        # planner alone. Asking again could return a different plan, and every
+        # later step would build on the divergence.
+        decision = json.loads(row["payload"])
+        log(
+            "replayed",
+            run=run_id,
+            seq=seq,
+            tool=describe(decision),
+            args=json.dumps(decision.get("tool_args", {})),
+            llm_calls=await planner.call_count(),
+        )
+        return decision
+
+    if row is None:
+        crash("before_decide")
+        await conn.execute(
+            """
+            insert into journal_events (run_id, seq, event_type, payload, status, epoch)
+            values ($1, $2, 'decision', '{}'::jsonb, 'intent', $3)
+            """,
+            run_id,
+            seq,
+            epoch,
+        )
+    # A row in 'intent' means the planner may have answered and we lost it.
+    # Nothing exists to replay, so this step gets decided again. It costs one
+    # call, and correctness holds because nobody acted on the lost answer.
+
+    log("deciding", run=run_id, seq=seq)
+    history = await load_history(conn, run_id)
+    decision = await planner.decide(GOAL, history, tools.schemas_for_model())
+
+    crash("after_decide_before_journal")
+
+    event_type = "done" if decision.get("done") else "decision"
+    tag = await conn.execute(
+        """
+        update journal_events
+           set payload = $3::jsonb, event_type = $4, status = 'confirmed', confirmed_at = now()
+         where run_id = $1 and seq = $2 and epoch = $5 and status = 'intent'
+        """,
+        run_id,
+        seq,
+        json.dumps(decision),
+        event_type,
+        epoch,
+    )
+    if tag.split()[-1] == "0":
+        log("fenced", run=run_id, seq=seq, epoch=epoch)
+        raise SystemExit(f"superseded: journal confirm for {run_id}:{seq} matched no rows")
+
+    log(
+        "decided",
+        run=run_id,
+        seq=seq,
+        tool=describe(decision),
+        args=json.dumps(decision.get("tool_args", {})),
+        llm_calls=await planner.call_count(),
+    )
+
+    crash("after_decide")
+    return decision
+
+
+# --------------------------------------------------------------------------
+# tools
+# --------------------------------------------------------------------------
 
 
 async def write_confirm(
@@ -101,8 +218,7 @@ async def run_step(
 
     # Validate before the intent row exists. A malformed decision fails here,
     # where it cannot cause a side effect.
-    entry = tools.get(tool_name)
-    entry.validate(tool_args)
+    tools.get(tool_name).validate(tool_args)
 
     crash("before_intent")
 
@@ -141,34 +257,49 @@ async def flag(conn: asyncpg.Connection, idempotency_key: str, epoch: int) -> No
         """
         update side_effects
            set status = 'flagged'
-         where idempotency_key = $1
-           and epoch = $2
-           and status = 'intent'
+         where idempotency_key = $1 and epoch = $2 and status = 'intent'
         """,
         idempotency_key,
         epoch,
     )
 
 
-async def recover(conn: asyncpg.Connection, run_id: str, epoch: int) -> tuple[set[int], set[int]]:
-    """Resolve every row left in the unknown window.
+# --------------------------------------------------------------------------
+# recovery
+# --------------------------------------------------------------------------
 
-    Returns the steps needing no further work, and the steps a human has to
-    resolve before the run may continue.
+
+async def recover(conn: asyncpg.Connection, run_id: str, epoch: int) -> tuple[set[int], set[int]]:
+    """Resolve every tool call left in the unknown window.
+
+    Journaled decisions are handled by decide_step as the loop reaches them.
+    Returns the steps whose tool call needs no further work, and the steps a
+    human has to resolve before the run may continue.
     """
     rows = await conn.fetch(
-        "select * from side_effects where run_id = $1 order by seq",
-        run_id,
+        "select * from side_effects where run_id = $1 order by seq", run_id
+    )
+    journal = await conn.fetch(
+        "select status from journal_events where run_id = $1", run_id
     )
 
     settled: set[int] = set()
     blocked: set[int] = set()
     reconciled = 0
+    calls_before = await planner.call_count()
 
     banner(f"RECOVERY run={run_id} epoch={epoch}")
+    jcounts = {"intent": 0, "confirmed": 0}
+    for row in journal:
+        jcounts[row["status"]] = jcounts.get(row["status"], 0) + 1
     counts = {"intent": 0, "confirmed": 0, "flagged": 0}
     for row in rows:
         counts[row["status"]] = counts.get(row["status"], 0) + 1
+    print(
+        f"  journal: steps={len(journal)}  confirmed={jcounts['confirmed']}"
+        f"  intent={jcounts['intent']}",
+        flush=True,
+    )
     print(
         f"  tools:   calls={len(rows)}  confirmed={counts['confirmed']}"
         f"  intent={counts['intent']}  flagged={counts['flagged']}",
@@ -187,14 +318,12 @@ async def recover(conn: asyncpg.Connection, run_id: str, epoch: int) -> tuple[se
         if row["status"] == "flagged":
             print(
                 f"  FLAGGED key={idempotency_key} tool={tool_name}"
-                f" args={row['tool_args']} created_at={row['created_at']}"
-                "  (needs a human)",
+                f" args={row['tool_args']} created_at={row['created_at']}  (needs a human)",
                 flush=True,
             )
             blocked.add(seq)
             continue
 
-        # status == 'intent': the outcome is unknown.
         if not tools.get(tool_name).supports_idempotency_key:
             # No key means no safe retry. A second attempt could create a second
             # resource, and no request distinguishes a lost response from a lost
@@ -203,8 +332,7 @@ async def recover(conn: asyncpg.Connection, run_id: str, epoch: int) -> tuple[se
             log("flagged", key=idempotency_key, reason="remote has no idempotency key")
             print(
                 f"  FLAGGED key={idempotency_key} tool={tool_name}"
-                f" args={row['tool_args']} created_at={row['created_at']}"
-                "  (needs a human)",
+                f" args={row['tool_args']} created_at={row['created_at']}  (needs a human)",
                 flush=True,
             )
             blocked.add(seq)
@@ -230,8 +358,17 @@ async def recover(conn: asyncpg.Connection, run_id: str, epoch: int) -> tuple[se
         settled.add(seq)
         reconciled += 1
 
+    calls_after = await planner.call_count()
+    print(
+        f"  llm_calls before={calls_before} after={calls_after}"
+        f"  ({'unchanged' if calls_before == calls_after else 'CHANGED'})",
+        flush=True,
+    )
     banner(f"RECOVERY COMPLETE  reconciled={reconciled} flagged={len(blocked)}")
     return settled, blocked
+
+
+# --------------------------------------------------------------------------
 
 
 async def main() -> None:
@@ -248,10 +385,9 @@ async def main() -> None:
         epoch = await conn.fetchval("select epoch from runs where run_id = $1", RUN_ID)
 
         log("registry", tools=",".join(tools.REGISTRY))
-
         settled, blocked = await recover(conn, RUN_ID, epoch)
 
-        for seq, (tool_name, tool_args) in enumerate(PLAN):
+        for seq in range(MAX_STEPS):
             if seq in blocked:
                 log("blocked", run=RUN_ID, seq=seq, reason="flagged step needs a human")
                 await conn.execute(
@@ -259,18 +395,29 @@ async def main() -> None:
                     RUN_ID,
                     epoch,
                 )
-                break
+                return
+
+            decision = await decide_step(conn, RUN_ID, seq, epoch)
+
+            if decision.get("done"):
+                await conn.execute(
+                    "update runs set status = 'done' where run_id = $1 and epoch = $2",
+                    RUN_ID,
+                    epoch,
+                )
+                log("done", run=RUN_ID, steps=seq, llm_calls=await planner.call_count())
+                return
+
             if seq in settled:
-                log("skipped", run=RUN_ID, seq=seq, reason="already confirmed")
+                log("skipped", run=RUN_ID, seq=seq, reason="tool call already confirmed")
                 continue
-            await run_step(conn, RUN_ID, seq, tool_name, tool_args, epoch)
-        else:
-            await conn.execute(
-                "update runs set status = 'done' where run_id = $1 and epoch = $2",
-                RUN_ID,
-                epoch,
-            )
-            log("done", run=RUN_ID, steps=len(PLAN))
+
+            await run_step(conn, RUN_ID, seq, decision["tool_name"], decision["tool_args"], epoch)
+
+        log("guard", run=RUN_ID, reason=f"reached MAX_STEPS={MAX_STEPS} without DONE")
+        await conn.execute(
+            "update runs set status = 'failed' where run_id = $1 and epoch = $2", RUN_ID, epoch
+        )
     finally:
         await conn.close()
 
