@@ -10,7 +10,7 @@ MOCK_CLOUD_URL = "http://localhost:9000"
 
 async def check_tables_exist(conn: asyncpg.Connection) -> list[str]:
     failures = []
-    for table in ("runs", "side_effects"):
+    for table in ("runs", "journal_events", "side_effects"):
         exists = await conn.fetchval(
             "select exists (select 1 from information_schema.tables where table_name = $1)",
             table,
@@ -23,9 +23,9 @@ async def check_tables_exist(conn: asyncpg.Connection) -> list[str]:
 async def check_idempotent_provision() -> list[str]:
     failures = []
     payload = {
-        "resource_name": "srv-231",
-        "spec": "t3.micro",
-        "idempotency_key": "check_setup:srv-231",
+        "tool_name": "create_server",
+        "tool_args": {"name": "srv-231", "spec": "t3.micro"},
+        "idempotency_key": "check_setup:0",
     }
 
     async with httpx.AsyncClient() as client:
