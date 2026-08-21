@@ -19,12 +19,21 @@ decided.
 
 ## Layout
 
-- `runtime.py` — the agent loop, the journal, and recovery
+The import graph runs one way. `recovery` reaches for `executor` and `journal`,
+both reach for `tools`, and nothing reaches back.
+
+- `runtime.py` — the loop: claim the run, recover, then step until DONE
+- `journal.py` — decisions, replay, and what the planner cost
+- `executor.py` — one tool call, intent row first
+- `recovery.py` — what a crash left behind, settled on startup
 - `tools.py` — the `@tool` decorator, the registry, and dispatch
 - `demo_tools.py` — the three tools the demo agent chooses among
 - `planner.py` — client for the planner
-- [`mock/`](mock/) — the two mock remotes and the Postgres schema. See
-  [`mock/README.md`](mock/README.md).
+- `crashpoints.py` — the seven points `CRASH_AT` can kill the process at
+- `config.py` — settings read from the environment
+- `logs.py` — the one-event-per-line output the crash tests assert on
+- `schema.sql` — the Postgres tables the runtime's state and history live in
+- [`mock/`](mock/) — the two mock remotes. See [`mock/README.md`](mock/README.md).
 
 ## Run it
 

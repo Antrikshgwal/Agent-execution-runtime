@@ -3,7 +3,7 @@ create table if not exists runs (
     goal        text not null default '',
     status      text not null default 'running',   -- running | done | failed
     created_at  timestamptz not null default now(),
-    epoch       integer not null default 0,        -- fencing token, bumped on claim
+    epoch       integer not null default 0,        -- fencing token, bumped by claim from phase 7
     owner       text,                              -- worker holding the claim, diagnostic only
     claimed_at  timestamptz
 );

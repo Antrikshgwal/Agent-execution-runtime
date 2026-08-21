@@ -1,7 +1,7 @@
-# Mocks and schema
+# Mocks
 
-The two remotes the runtime talks to, plus the database schema. No agent loop,
-worker, or recovery logic here.
+The two remotes the runtime talks to, and the Postgres they run against. No
+agent loop, worker, or recovery logic here.
 
 All commands below run from this `mock/` directory.
 
@@ -23,10 +23,11 @@ not shadow it.
 ## 2. Load the schema
 
 ```bash
-psql postgresql://durable:durable@localhost:5433/durable -f schema.sql
+psql postgresql://durable:durable@localhost:5433/durable -f ../schema.sql
 ```
 
-Creates `runs`, `journal_events`, and `side_effects`.
+Creates `runs`, `journal_events`, and `side_effects`. The schema lives at the
+repository root because it describes the runtime's own state, not the mocks.
 
 ## 3. Start the two mocks
 
