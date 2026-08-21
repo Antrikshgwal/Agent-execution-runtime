@@ -11,6 +11,7 @@ re-sends stranded tool calls under their original keys.
     journal.py    decisions, replay, and what the planner cost
     executor.py   one tool call, intent-first
     recovery.py   what a crash left behind
+    fencing.py    who owns the run, and what happens to everyone else
     tools.py      the registry the loop dispatches through
 """
 
@@ -22,6 +23,7 @@ import config
 import crashpoints
 import demo_tools  # noqa: F401  (importing registers the demo tools)
 import executor
+import fencing
 import planner
 import recovery
 import tools
@@ -29,34 +31,25 @@ from journal import decide_step, llm_calls
 from logs import log
 
 
-async def claim(conn: asyncpg.Connection, run_id: str, goal: str) -> int:
-    """Start or resume the run, returning the epoch that guards its writes."""
-    await conn.execute(
-        """
-        insert into runs (run_id, goal, status) values ($1, $2, 'running')
-        on conflict (run_id) do nothing
-        """,
-        run_id,
-        goal,
-    )
-    epoch = await conn.fetchval("select epoch from runs where run_id = $1", run_id)
-    if epoch is None:
-        # The insert above put the row there. Nothing in this runtime deletes a
-        # run, so a miss here means something outside it did.
-        raise RuntimeError(f"run {run_id} vanished between its insert and its read")
-    return epoch
-
-
 async def finish(conn: asyncpg.Connection, run_id: str, epoch: int, status: str) -> None:
-    await conn.execute(
+    """Close the run out, if this worker is still the one entitled to.
+
+    The row count is the whole check. Without it a superseded worker's verdict
+    vanishes silently, and the run it no longer owns looks to that worker like it
+    ended the way that worker thought it did.
+    """
+    tag = await conn.execute(
         "update runs set status = $2 where run_id = $1 and epoch = $3",
         run_id,
         status,
         epoch,
     )
+    if not fencing.matched(tag):
+        await fencing.superseded(conn, run_id, epoch, f"finish as {status}")
 
 
 async def run(conn: asyncpg.Connection, run_id: str, epoch: int) -> None:
+    """Settle what a crash left behind, then step until the agent is done."""
     outcome = await recovery.recover(conn, run_id, epoch)
 
     for seq in range(config.MAX_STEPS):
@@ -89,10 +82,11 @@ async def run(conn: asyncpg.Connection, run_id: str, epoch: int) -> None:
 
 
 async def main() -> None:
+    """Claim the configured run and work it to a conclusion."""
     conn = await asyncpg.connect(config.DATABASE_URL)
     try:
         log("registry", tools=",".join(tools.REGISTRY), planner=planner.BACKEND)
-        epoch = await claim(conn, config.RUN_ID, config.GOAL)
+        epoch = await fencing.claim(conn, config.RUN_ID, config.GOAL, config.WORKER)
         await run(conn, config.RUN_ID, epoch)
     finally:
         await conn.close()
