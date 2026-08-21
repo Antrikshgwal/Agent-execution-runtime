@@ -110,7 +110,7 @@ async def recover(conn: asyncpg.Connection, run_id: str, epoch: int) -> Outcome:
             # No key means no safe retry. A second attempt could create a second
             # resource, and no request distinguishes a lost response from a lost
             # request. Hand it to a human instead.
-            await executor.flag(conn, row["idempotency_key"], epoch)
+            await executor.flag(conn, run_id, row["idempotency_key"], epoch)
             log(
                 "flagged",
                 key=row["idempotency_key"],

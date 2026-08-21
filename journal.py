@@ -11,6 +11,7 @@ from typing import Any
 import asyncpg
 
 import config
+import fencing
 import planner
 import tools
 from crashpoints import crash
@@ -70,16 +71,45 @@ async def load_history(conn: asyncpg.Connection, run_id: str) -> list[dict[str, 
 
 
 async def _open_step(conn: asyncpg.Connection, run_id: str, seq: int, epoch: int) -> None:
-    """Commit the intent row that precedes the planner call."""
-    await conn.execute(
+    """Commit the intent row that precedes the planner call.
+
+    Guarded, so a superseded worker cannot append a step at a `seq` the owner has
+    already passed, and cannot reach the planner call that follows.
+    """
+    tag = await conn.execute(
         """
         insert into journal_events (run_id, seq, event_type, payload, status, epoch)
-        values ($1, $2, 'decision', '{}'::jsonb, 'intent', $3)
+        select $1, $2, 'decision', '{}'::jsonb, 'intent', $3
+         where exists (select 1 from runs r where r.run_id = $1 and r.epoch = $3)
         """,
         run_id,
         seq,
         epoch,
     )
+    if not fencing.matched(tag):
+        await fencing.superseded(conn, run_id, epoch, f"journal intent for {run_id}:{seq}")
+
+
+async def _count_attempt(conn: asyncpg.Connection, run_id: str, seq: int, epoch: int) -> None:
+    """Charge this worker for the planner call it is about to make.
+
+    Guarded for two reasons. It is a write, so a superseded worker has no
+    business making it; and it sits immediately before the call, so failing here
+    is what stops that worker from spending money on a run it no longer owns.
+    """
+    tag = await conn.execute(
+        """
+        update journal_events j
+           set llm_attempts = llm_attempts + 1
+         where j.run_id = $1 and j.seq = $2
+           and exists (select 1 from runs r where r.run_id = j.run_id and r.epoch = $3)
+        """,
+        run_id,
+        seq,
+        epoch,
+    )
+    if not fencing.matched(tag):
+        await fencing.superseded(conn, run_id, epoch, f"attempt count for {run_id}:{seq}")
 
 
 async def _confirm_step(
@@ -89,12 +119,19 @@ async def _confirm_step(
     decision: dict[str, Any],
     epoch: int,
 ) -> None:
-    """Record the answer, guarded by the epoch that claimed the step."""
+    """Record the answer, guarded by whether this worker still owns the run.
+
+    A restart re-decides a step the previous epoch left at `intent`, so the row
+    is often stamped with an epoch nobody holds. See fencing.py for why the
+    guard asks about `runs` rather than about that stamp.
+    """
     tag = await conn.execute(
         """
-        update journal_events
-           set payload = $3::jsonb, event_type = $4, status = 'confirmed', confirmed_at = now()
-         where run_id = $1 and seq = $2 and epoch = $5 and status = 'intent'
+        update journal_events j
+           set payload = $3::jsonb, event_type = $4, status = 'confirmed',
+               confirmed_at = now(), epoch = $5
+         where j.run_id = $1 and j.seq = $2 and j.status = 'intent'
+           and exists (select 1 from runs r where r.run_id = j.run_id and r.epoch = $5)
         """,
         run_id,
         seq,
@@ -102,9 +139,8 @@ async def _confirm_step(
         "done" if decision.get("done") else "decision",
         epoch,
     )
-    if tag.split()[-1] == "0":
-        log("fenced", run=run_id, seq=seq, epoch=epoch)
-        raise SystemExit(f"superseded: journal confirm for {run_id}:{seq} matched no rows")
+    if not fencing.matched(tag):
+        await fencing.superseded(conn, run_id, epoch, f"journal confirm for {run_id}:{seq}")
 
 
 async def decide_step(
@@ -138,11 +174,7 @@ async def decide_step(
 
     # Count the attempt before making it, so a crash during the call still
     # leaves the spend recorded.
-    await conn.execute(
-        "update journal_events set llm_attempts = llm_attempts + 1 where run_id = $1 and seq = $2",
-        run_id,
-        seq,
-    )
+    await _count_attempt(conn, run_id, seq, epoch)
     log("deciding", run=run_id, seq=seq, llm_calls=await llm_calls(conn, run_id))
 
     history = await load_history(conn, run_id)

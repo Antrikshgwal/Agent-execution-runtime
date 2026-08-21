@@ -10,6 +10,7 @@ from typing import Any
 
 import asyncpg
 
+import fencing
 import tools
 from crashpoints import crash
 from logs import log
@@ -22,25 +23,29 @@ def key_for(run_id: str, seq: int) -> str:
 
 
 async def write_confirm(
-    conn: asyncpg.Connection, idempotency_key: str, result: str, epoch: int
+    conn: asyncpg.Connection, run_id: str, idempotency_key: str, result: str, epoch: int
 ) -> None:
-    """Guarded by epoch and by status, so a superseded worker matches zero rows
-    instead of overwriting the owner's state."""
+    """Guarded by ownership and by status, so a superseded worker matches zero
+    rows instead of overwriting the owner's state.
+
+    Recovery re-sends a call the previous epoch left stranded, so the row being
+    confirmed is often stamped with an epoch nobody holds any more. See
+    fencing.py for why the guard asks about `runs` rather than about that stamp.
+    """
     tag = await conn.execute(
         """
-        update side_effects
-           set status = 'confirmed', result = $2, confirmed_at = now()
-         where idempotency_key = $1
-           and epoch = $3
-           and status = 'intent'
+        update side_effects s
+           set status = 'confirmed', result = $2, confirmed_at = now(), epoch = $3
+         where s.idempotency_key = $1
+           and s.status = 'intent'
+           and exists (select 1 from runs r where r.run_id = s.run_id and r.epoch = $3)
         """,
         idempotency_key,
         result,
         epoch,
     )
-    if tag.split()[-1] == "0":
-        log("fenced", key=idempotency_key, epoch=epoch)
-        raise SystemExit(f"superseded: confirm for {idempotency_key} matched no rows")
+    if not fencing.matched(tag):
+        await fencing.superseded(conn, run_id, epoch, f"confirm for {idempotency_key}")
 
 
 async def write_intent(
@@ -51,12 +56,19 @@ async def write_intent(
     tool_args: dict[str, Any],
     epoch: int,
 ) -> str:
+    """Commit the intent row, but only while this worker still owns the run.
+
+    An unguarded insert here lets a superseded worker create a row the owner will
+    later collide with on the primary key, or strand one nobody will confirm.
+    Fencing before the row exists also means fencing before the call goes out.
+    """
     idempotency_key = key_for(run_id, seq)
-    await conn.execute(
+    tag = await conn.execute(
         """
         insert into side_effects
             (idempotency_key, run_id, seq, tool_name, tool_args, status, epoch)
-        values ($1, $2, $3, $4, $5::jsonb, 'intent', $6)
+        select $1, $2, $3, $4, $5::jsonb, 'intent', $6
+         where exists (select 1 from runs r where r.run_id = $2 and r.epoch = $6)
         """,
         idempotency_key,
         run_id,
@@ -65,20 +77,35 @@ async def write_intent(
         json.dumps(tool_args),
         epoch,
     )
+    if not fencing.matched(tag):
+        await fencing.superseded(conn, run_id, epoch, f"intent for {idempotency_key}")
+
     log("intent", run=run_id, seq=seq, key=idempotency_key, tool=tool_name)
     return idempotency_key
 
 
-async def flag(conn: asyncpg.Connection, idempotency_key: str, epoch: int) -> None:
-    await conn.execute(
+async def flag(
+    conn: asyncpg.Connection, run_id: str, idempotency_key: str, epoch: int
+) -> None:
+    """Hand a call to a human, durably.
+
+    The row count matters as much as the write. Without it a flag that matched
+    nothing still logs as though it succeeded, and the row sits at `intent` for
+    every restart that follows to flag again.
+    """
+    tag = await conn.execute(
         """
-        update side_effects
-           set status = 'flagged'
-         where idempotency_key = $1 and epoch = $2 and status = 'intent'
+        update side_effects s
+           set status = 'flagged', epoch = $2
+         where s.idempotency_key = $1
+           and s.status = 'intent'
+           and exists (select 1 from runs r where r.run_id = s.run_id and r.epoch = $2)
         """,
         idempotency_key,
         epoch,
     )
+    if not fencing.matched(tag):
+        await fencing.superseded(conn, run_id, epoch, f"flag for {idempotency_key}")
 
 
 async def call_tool(
@@ -98,7 +125,7 @@ async def call_tool(
 
     crash("after_call")
 
-    await write_confirm(conn, idempotency_key, result, epoch)
+    await write_confirm(conn, run_id, idempotency_key, result, epoch)
     log("confirmed", run=run_id, seq=seq, key=idempotency_key, result=result, remote=remote)
     return result, remote
 
