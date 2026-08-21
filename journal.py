@@ -28,9 +28,13 @@ async def llm_calls(conn: asyncpg.Connection, run_id: str) -> int:
     money spent rather than answers received. A real provider offers nothing
     equivalent to read after a restart.
     """
-    return await conn.fetchval(
-        "select coalesce(sum(llm_attempts), 0) from journal_events where run_id = $1",
-        run_id,
+    # sum() over no rows is null, coalesce turns that into 0, and an aggregate
+    # always returns exactly one row. int() states that for the type checker.
+    return int(
+        await conn.fetchval(
+            "select coalesce(sum(llm_attempts), 0) from journal_events where run_id = $1",
+            run_id,
+        )
     )
 
 

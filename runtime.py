@@ -19,6 +19,7 @@ import asyncio
 import asyncpg
 
 import config
+import crashpoints
 import demo_tools  # noqa: F401  (importing registers the demo tools)
 import executor
 import planner
@@ -38,7 +39,12 @@ async def claim(conn: asyncpg.Connection, run_id: str, goal: str) -> int:
         run_id,
         goal,
     )
-    return await conn.fetchval("select epoch from runs where run_id = $1", run_id)
+    epoch = await conn.fetchval("select epoch from runs where run_id = $1", run_id)
+    if epoch is None:
+        # The insert above put the row there. Nothing in this runtime deletes a
+        # run, so a miss here means something outside it did.
+        raise RuntimeError(f"run {run_id} vanished between its insert and its read")
+    return epoch
 
 
 async def finish(conn: asyncpg.Connection, run_id: str, epoch: int, status: str) -> None:
@@ -54,6 +60,8 @@ async def run(conn: asyncpg.Connection, run_id: str, epoch: int) -> None:
     outcome = await recovery.recover(conn, run_id, epoch)
 
     for seq in range(config.MAX_STEPS):
+        crashpoints.at_step(seq)
+
         if seq in outcome.blocked:
             # The agent's next decision would be conditioned on a result nobody
             # holds, so the run stops here for a human.

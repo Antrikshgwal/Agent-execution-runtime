@@ -30,6 +30,7 @@ both reach for `tools`, and nothing reaches back.
 - `demo_tools.py` — the three tools the demo agent chooses among
 - `planner.py` — client for the planner
 - `crashpoints.py` — the seven points `CRASH_AT` can kill the process at
+- `crashtest.py` — runs each of those points and asserts on what recovery produced
 - `config.py` — settings read from the environment
 - `logs.py` — the one-event-per-line output the crash tests assert on
 - `schema.sql` — the Postgres tables the runtime's state and history live in
@@ -68,19 +69,41 @@ survives `kill -9` and reflects money spent rather than answers received.
 ## Crash tests
 
 `CRASH_AT` hard-kills the process at a named point with `os._exit(1)`, which
-skips the cleanup a real `kill -9` also skips.
+skips the cleanup a real `kill -9` also skips. `CRASH_SEQ` chooses which step it
+dies on, so the kill can land on the first step or partway through a run.
+
+Points: `before_decide`, `after_decide_before_journal`, `after_decide`,
+`before_intent`, `after_intent`, `after_call`, `after_confirm`.
+
+`crashtest.py` runs them. Each case kills a process at one point, restarts it,
+and checks what recovery produced against the mock cloud's key map, the mock
+planner's call counter, and all three tables:
+
+```bash
+python crashtest.py                 # every point, crashing on the first step
+python crashtest.py --seq 2         # every point, crashing partway through
+python crashtest.py after_call      # one point
+```
+
+Both mocks must stay up for the whole run. Restarting `mock_cloud` wipes the key
+map and restarting `mock_llm` resets the counter, and either one voids the
+result.
+
+Two of the seven cases are the proofs the design exists for:
+
+- **`after_call`** kills the process after the remote acted and before the
+  confirm committed. Recovery re-sends under the same key, the remote answers
+  `already_done`, the resource count does not move, and the stored result is the
+  id from before the crash.
+- **`after_decide`** kills it after the decision was journaled and before the
+  tool ran. The restart replays the decision, and the planner's counter holds
+  flat. A counter that ticks up means the runtime paid to re-think a step it had
+  already decided, which breaks the central claim even when the final state
+  happens to look right.
+
+To watch one by hand instead:
 
 ```bash
 CRASH_AT=after_decide RUN_ID=demo python runtime.py   # dies with a decision journaled
 RUN_ID=demo python runtime.py                          # recovers
 ```
-
-Points: `before_decide`, `after_decide_before_journal`, `after_decide`,
-`before_intent`, `after_intent`, `after_call`, `after_confirm`.
-
-Two lines in the restart output carry the result:
-
-- `remote=already_done` — recovery found the resource created before the crash
-  instead of creating a second one.
-- `llm_calls before=N after=N` — the agent replayed its decisions instead of
-  paying to re-think them.
