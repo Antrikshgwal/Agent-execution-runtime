@@ -3,7 +3,7 @@ create table if not exists runs (
     goal        text not null default '',
     status      text not null default 'running',   -- running | done | failed
     created_at  timestamptz not null default now(),
-    epoch       integer not null default 0,        -- fencing token, bumped by claim from phase 7
+    epoch       integer not null default 0,        -- fencing token; a new run starts at 0 and claim bumps it
     owner       text,                              -- worker holding the claim, diagnostic only
     claimed_at  timestamptz
 );
@@ -18,7 +18,7 @@ create table if not exists journal_events (
     status        text not null,        -- intent | confirmed
     created_at    timestamptz not null default now(),
     confirmed_at  timestamptz,
-    epoch         integer not null default 0,
+    epoch         integer not null,           -- the worker that wrote the row
     llm_attempts  integer not null default 0,  -- planner calls spent on this step
     primary key (run_id, seq)
 );
@@ -38,6 +38,13 @@ create table if not exists side_effects (
     result           text,              -- tool return value, null until confirmed
     created_at       timestamptz not null default now(),
     confirmed_at     timestamptz,
-    epoch            integer not null default 0,
+    epoch            integer not null,  -- the worker that wrote the row
     unique (run_id, seq)
 );
+
+-- Both child tables take their epoch from the worker that writes the row, and
+-- there is no sensible default for it. A default of 0 lets an insert that forgot
+-- the column land on an epoch nobody holds, where no guarded write will ever
+-- match it again. Written as an alter so an existing database drops it too.
+alter table journal_events alter column epoch drop default;
+alter table side_effects   alter column epoch drop default;
