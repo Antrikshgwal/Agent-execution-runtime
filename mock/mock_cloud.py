@@ -1,3 +1,10 @@
+"""A stand-in cloud provisioning API that dedupes on the idempotency key.
+
+Models the one property the runtime relies on from a real provider: a repeated
+request carrying a key that has already been served performs no new work and
+returns the original result. That is what makes a retry after a crash safe.
+"""
+
 from typing import Any
 
 from fastapi import FastAPI
@@ -17,6 +24,8 @@ PREFIXES = {
 
 
 class ProvisionRequest(BaseModel):
+    """One provisioning call: what to create, and the key that identifies it."""
+
     tool_name: str
     tool_args: dict[str, Any]
     idempotency_key: str
@@ -24,6 +33,7 @@ class ProvisionRequest(BaseModel):
 
 @app.post("/provision")
 def provision(req: ProvisionRequest):
+    """Create the resource, or return the existing result for a seen key."""
     if req.idempotency_key in created:
         return {"status": "already_done", "result": created[req.idempotency_key]}
 
@@ -35,4 +45,5 @@ def provision(req: ProvisionRequest):
 
 @app.get("/created")
 def get_created():
+    """Return every key served so far, for inspecting a run after the fact."""
     return created

@@ -6,3 +6,6 @@ pydantic
 # PLANNER=gemini only. The mock planner needs neither.
 google-genai
 python-dotenv
+
+# linter
+pylint

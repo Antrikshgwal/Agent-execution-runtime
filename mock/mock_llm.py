@@ -17,10 +17,12 @@ from pydantic import BaseModel
 
 app = FastAPI()
 
-calls = 0
+state: dict[str, int] = {"calls": 0}
 
 
 class DecideRequest(BaseModel):
+    """What the planner is given: the goal, the run so far, and the tool set."""
+
     goal: str
     history: list[dict[str, Any]]
     tools: list[dict[str, Any]]
@@ -28,19 +30,20 @@ class DecideRequest(BaseModel):
 
 @app.post("/decide")
 def decide(req: DecideRequest):
-    global calls
-    calls += 1
+    """Return the next tool call for this step, or done once the plan is spent."""
+    state["calls"] += 1
+    call = state["calls"]
     step = len(req.history)
 
     if step == 0:
         return {
             "tool_name": "create_server",
-            "tool_args": {"name": f"srv-{calls}", "spec": "t3.micro"},
+            "tool_args": {"name": f"srv-{call}", "spec": "t3.micro"},
         }
     if step == 1:
         return {
             "tool_name": "create_database",
-            "tool_args": {"name": f"app-db-{calls}", "engine": "postgres", "size_gb": 20},
+            "tool_args": {"name": f"app-db-{call}", "engine": "postgres", "size_gb": 20},
         }
     if step == 2:
         # Reads the server it chose at step 0, which only works if the runtime
@@ -49,7 +52,7 @@ def decide(req: DecideRequest):
         return {
             "tool_name": "create_dns_record",
             "tool_args": {
-                "hostname": f"app-{calls}.example.com",
+                "hostname": f"app-{call}.example.com",
                 "record_type": "A",
                 "target": server,
             },
@@ -59,4 +62,5 @@ def decide(req: DecideRequest):
 
 @app.get("/calls")
 def get_calls():
-    return {"calls": calls}
+    """Return how many decisions have been asked for since the process started."""
+    return {"calls": state["calls"]}
