@@ -20,17 +20,19 @@ decided.
 ## Layout
 
 The import graph runs one way. `recovery` reaches for `executor` and `journal`,
-both reach for `tools`, and nothing reaches back.
+both reach for `tools` and `fencing`, and nothing reaches back.
 
 - `runtime.py` — the loop: claim the run, recover, then step until DONE
 - `journal.py` — decisions, replay, and what the planner cost
 - `executor.py` — one tool call, intent row first
 - `recovery.py` — what a crash left behind, settled on startup
+- `fencing.py` — claiming a run, and what happens to a worker that loses it
 - `tools.py` — the `@tool` decorator, the registry, and dispatch
 - `demo_tools.py` — the three tools the demo agent chooses among
 - `planner.py` — client for the planner
 - `crashpoints.py` — the seven points `CRASH_AT` can kill the process at
 - `crashtest.py` — runs each of those points and asserts on what recovery produced
+- `fencetest.py` — presses each guarded write from both sides of a stolen run
 - `config.py` — settings read from the environment
 - `logs.py` — the one-event-per-line output the crash tests assert on
 - `schema.sql` — the Postgres tables the runtime's state and history live in
@@ -107,3 +109,58 @@ To watch one by hand instead:
 CRASH_AT=after_decide RUN_ID=demo python runtime.py   # dies with a decision journaled
 RUN_ID=demo python runtime.py                          # recovers
 ```
+
+## Fencing
+
+A worker takes a run by incrementing `runs.epoch`, conditioned on the value it
+just read:
+
+```sql
+update runs
+   set epoch = epoch + 1, owner = $2, claimed_at = now()
+ where run_id = $1 and epoch = $3
+returning epoch;
+```
+
+Postgres serializes two updates on the same row, so of two workers that read the
+same epoch exactly one finds its `where` clause still true. The other matches no
+rows and learns it lost before writing anything:
+
+```
+INFO  claimed  run=twow  epoch=1  owner=host-16676-4956fe
+INFO  fenced   run=twow  epoch=0  observed=1  write=claim
+```
+
+Every later write to `journal_events` and `side_effects` asks the same question,
+by looking at `runs.epoch` rather than at the epoch stamped on the row being
+written. The distinction is the whole point: recovery settles rows an earlier
+epoch stranded on every restart, so a worker comparing its epoch against the
+row's stamp would fence itself against its own crashed predecessor. Crash a run
+and restart it, and you can watch the new epoch adopt the old one's work:
+
+```
+INFO  claimed    run=demo  epoch=2  owner=host-9488-4e4c61
+INFO  confirmed  run=demo  seq=0  key=demo:0  result=i-0000533  remote=already_done
+```
+
+A guarded write that matches nothing is not always a lost race, so the log says
+which it was. `fenced` means the run moved to another epoch. `stalled` means it
+did not, and the row was simply not in the state the write required.
+
+```bash
+python fencetest.py
+```
+
+It bumps `runs.epoch` by hand to stand in for another worker's claim, then
+presses each guarded write from both sides. The new owner must settle what the
+old epoch left behind. Nobody else gets to write at all, including before the
+planner call that would otherwise be paid for.
+
+Needs Postgres. The mocks can stay down, since nothing there calls a tool.
+
+`runs.owner` and `runs.claimed_at` are written but nothing reads them. As
+recorded, `claimed_at` says when the claim happened, not when the owner was last
+alive, so deciding a claim is stale enough to steal would need the owner to
+heartbeat it. Claiming does not wait on a lease: a crashed worker leaves no
+signal that it died, so a restart has to be able to take its own run back, and
+fencing is what makes the previous owner harmless if it was only stalled.
