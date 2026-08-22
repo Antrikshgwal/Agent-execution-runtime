@@ -11,7 +11,7 @@ from typing import Any
 import asyncpg
 
 from agent_runtime import config, fencing, planner, tools
-from agent_runtime.crashpoints import crash
+from agent_runtime.crashpoints import interrupt
 from agent_runtime.logs import log
 
 
@@ -163,7 +163,7 @@ async def decide_step(
         return decision
 
     if row is None:
-        crash("before_decide")
+        interrupt("before_decide")
         await _open_step(conn, run_id, seq, epoch)
     # A row in 'intent' means the planner may have answered and we lost it.
     # Nothing exists to replay, so this step gets decided again. It costs one
@@ -177,7 +177,7 @@ async def decide_step(
     history = await load_history(conn, run_id)
     decision = await planner.decide(config.GOAL, history, tools.schemas_for_model())
 
-    crash("after_decide_before_journal")
+    interrupt("after_decide_before_journal")
 
     await _confirm_step(conn, run_id, seq, decision, epoch)
     log(
@@ -189,5 +189,5 @@ async def decide_step(
         llm_calls=await llm_calls(conn, run_id),
     )
 
-    crash("after_decide")
+    interrupt("after_decide")
     return decision

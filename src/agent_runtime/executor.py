@@ -11,7 +11,7 @@ from typing import Any
 import asyncpg
 
 from agent_runtime import fencing, tools
-from agent_runtime.crashpoints import crash
+from agent_runtime.crashpoints import interrupt
 from agent_runtime.logs import log
 
 
@@ -122,7 +122,7 @@ async def call_tool(
     log("calling", run=run_id, seq=seq, key=idempotency_key, attempt=attempt)
     result, remote = await tools.dispatch(tool_name, tool_args, idempotency_key)
 
-    crash("after_call")
+    interrupt("after_call")
 
     await write_confirm(conn, run_id, idempotency_key, result, epoch)
     log("confirmed", run=run_id, seq=seq, key=idempotency_key, result=result, remote=remote)
@@ -141,12 +141,12 @@ async def run_step(
     # where it cannot cause a side effect.
     tools.get(tool_name).validate(tool_args)
 
-    crash("before_intent")
+    interrupt("before_intent")
     idempotency_key = await write_intent(conn, run_id, seq, tool_name, tool_args, epoch)
-    crash("after_intent")
+    interrupt("after_intent")
 
     await call_tool(
         conn, run_id, seq, tool_name, tool_args, idempotency_key, epoch, attempt=1
     )
 
-    crash("after_confirm")
+    interrupt("after_confirm")
