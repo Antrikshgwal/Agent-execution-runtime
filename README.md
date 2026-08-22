@@ -19,6 +19,13 @@ decided.
 
 ## Layout
 
+```
+src/agent_runtime/    the runtime
+tests/                the two proof harnesses
+mock/                 the remotes it talks to, and the Postgres they run against
+schema.sql            the tables the runtime's state and history live in
+```
+
 The import graph runs one way. `recovery` reaches for `executor` and `journal`,
 both reach for `tools` and `fencing`, and nothing reaches back.
 
@@ -31,17 +38,18 @@ both reach for `tools` and `fencing`, and nothing reaches back.
 - `demo_tools.py` — the three tools the demo agent chooses among
 - `planner.py` — client for the planner
 - `crashpoints.py` — the seven points `CRASH_AT` can kill the process at
-- `crashtest.py` — runs each of those points and asserts on what recovery produced
-- `fencetest.py` — presses each guarded write from both sides of a stolen run
 - `config.py` — settings read from the environment
-- `logs.py` — the one-event-per-line output the crash tests assert on
-- `schema.sql` — the Postgres tables the runtime's state and history live in
-- [`mock/`](mock/) — the two mock remotes. See [`mock/README.md`](mock/README.md).
+- `logs.py` — the one-event-per-line output the tests assert on
+
+Under `tests/`:
+
+- `crashtest.py` — runs each crash point and asserts on what recovery produced
+- `fencetest.py` — presses each guarded write from both sides of a stolen run
 
 ## Run it
 
 ```bash
-pip install -r requirements.txt
+pip install -e .
 ```
 
 Start Postgres and the mock cloud as described in `mock/README.md`, then pick a
@@ -51,13 +59,18 @@ planner.
 use. Needs `mock_llm` running:
 
 ```bash
-python runtime.py
+python -m agent_runtime
 ```
 
-**Gemini.** Put `GEMINI_API_KEY=...` in `.env.local`, which git ignores:
+The install also puts an `agent-runtime` command on the path, which does the
+same thing.
+
+**Gemini.** Needs the extra, and `GEMINI_API_KEY=...` in `.env.local`, which git
+ignores:
 
 ```bash
-PLANNER=gemini python runtime.py
+pip install -e ".[gemini]"
+PLANNER=gemini python -m agent_runtime
 ```
 
 `GEMINI_MODEL` overrides the default `gemini-3.5-flash`. A real model makes
@@ -77,14 +90,14 @@ dies on, so the kill can land on the first step or partway through a run.
 Points: `before_decide`, `after_decide_before_journal`, `after_decide`,
 `before_intent`, `after_intent`, `after_call`, `after_confirm`.
 
-`crashtest.py` runs them. Each case kills a process at one point, restarts it,
+`tests/crashtest.py` runs them. Each case kills a process at one point, restarts it,
 and checks what recovery produced against the mock cloud's key map, the mock
 planner's call counter, and all three tables:
 
 ```bash
-python crashtest.py                 # every point, crashing on the first step
-python crashtest.py --seq 2         # every point, crashing partway through
-python crashtest.py after_call      # one point
+python tests/crashtest.py                 # every point, crashing on the first step
+python tests/crashtest.py --seq 2         # every point, crashing partway through
+python tests/crashtest.py after_call      # one point
 ```
 
 Both mocks must stay up for the whole run. Restarting `mock_cloud` wipes the key
@@ -106,8 +119,8 @@ Two of the seven cases are the proofs the design exists for:
 To watch one by hand instead:
 
 ```bash
-CRASH_AT=after_decide RUN_ID=demo python runtime.py   # dies with a decision journaled
-RUN_ID=demo python runtime.py                          # recovers
+CRASH_AT=after_decide RUN_ID=demo python -m agent_runtime   # dies with a decision journaled
+RUN_ID=demo python -m agent_runtime                         # recovers
 ```
 
 ## Fencing
@@ -148,7 +161,7 @@ which it was. `fenced` means the run moved to another epoch. `stalled` means it
 did not, and the row was simply not in the state the write required.
 
 ```bash
-python fencetest.py
+python tests/fencetest.py
 ```
 
 It bumps `runs.epoch` by hand to stand in for another worker's claim, then
