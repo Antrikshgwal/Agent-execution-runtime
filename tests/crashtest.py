@@ -24,7 +24,6 @@ map, restarting mock_llm resets the counter, and either one voids the result.
 
 import argparse
 import asyncio
-import os
 import re
 import subprocess
 import sys
@@ -32,14 +31,12 @@ import time
 from dataclasses import dataclass
 
 import asyncpg
-import httpx
+
+from harness import check, child_env, find, mock_calls, remote_keys, truncate
 
 from agent_runtime import config
 from agent_runtime.crashpoints import POINTS
 from agent_runtime.logs import banner, line
-
-MOCK_CLOUD_URL = os.environ.get("MOCK_CLOUD_URL", "http://localhost:9000")
-MOCK_LLM_URL = os.environ.get("MOCK_LLM_URL", "http://localhost:9100")
 
 # The scripted planner's plan: three tool calls, then DONE. A run that finishes
 # clean therefore costs four planner calls, journals four steps, and creates
@@ -152,29 +149,15 @@ EXPECTED: dict[str, Expect] = {
 # --------------------------------------------------------------------------
 
 
-async def mock_calls() -> int:
-    """The planner's own counter, the instrument for the agent proof."""
-    async with httpx.AsyncClient(timeout=10) as client:
-        return (await client.get(f"{MOCK_LLM_URL}/calls")).json()["calls"]
-
-
-async def remote_keys() -> dict[str, str]:
-    """Every idempotency key the remote has served, mapped to what it returned."""
-    async with httpx.AsyncClient(timeout=10) as client:
-        return (await client.get(f"{MOCK_CLOUD_URL}/created")).json()
-
-
 def spawn(run_id: str, crash_at: str | None, crash_seq: int) -> subprocess.CompletedProcess:
     """One agent process. Blocking on purpose: the point is that it dies.
 
     Launched as `-m agent_runtime`, so the module being killed is the one a
     person runs rather than a copy reachable only from a particular directory.
     """
-    env = dict(os.environ, RUN_ID=run_id, PLANNER="mock", CRASH_SEQ=str(crash_seq))
+    env = child_env(run_id, CRASH_SEQ=str(crash_seq))
     if crash_at:
         env["CRASH_AT"] = crash_at
-    else:
-        env.pop("CRASH_AT", None)
     return subprocess.run(
         [sys.executable, "-m", "agent_runtime"],
         env=env,
@@ -182,36 +165,6 @@ def spawn(run_id: str, crash_at: str | None, crash_seq: int) -> subprocess.Compl
         text=True,
         check=False,
     )
-
-
-def events(output: str) -> list[tuple[str, dict[str, str]]]:
-    """Parse the runtime's log lines back into (event, fields).
-
-    Asserting on the log as well as on the database is deliberate. The log is
-    what a human reads after an incident, so a claim it cannot support is a
-    claim the design has not really made.
-    """
-    parsed = []
-    for raw in output.splitlines():
-        _, marker, rest = raw.partition(" INFO ")
-        if not marker:
-            continue
-        event, _, tail = rest.strip().partition(" ")
-        fields = {}
-        for chunk in tail.split("  "):
-            name, sep, value = chunk.strip().partition("=")
-            if sep:
-                fields[name] = value
-        parsed.append((event, fields))
-    return parsed
-
-
-def find(output: str, event: str, **match: str) -> dict[str, str] | None:
-    """The first logged event whose fields include every given pair."""
-    for name, fields in events(output):
-        if name == event and all(fields.get(k) == v for k, v in match.items()):
-            return fields
-    return None
 
 
 def recovery_totals(output: str) -> tuple[int, int]:
@@ -223,12 +176,6 @@ def recovery_totals(output: str) -> tuple[int, int]:
 # --------------------------------------------------------------------------
 # one case
 # --------------------------------------------------------------------------
-
-
-def check(failures: list[str], ok: bool, message: str) -> None:
-    """Record a failure, so one case reports everything wrong with it at once."""
-    if not ok:
-        failures.append(message)
 
 
 @dataclass(frozen=True)
@@ -269,7 +216,7 @@ class Observed:
 
 async def observe(conn: asyncpg.Connection, case: Case) -> Observed:
     """Run the case: a clean table, a process that dies, and one that recovers."""
-    await conn.execute("truncate side_effects, journal_events, runs")
+    await truncate(conn)
 
     calls_before = await mock_calls()
     crashed = spawn(case.run_id, crash_at=case.point, crash_seq=case.seq)
