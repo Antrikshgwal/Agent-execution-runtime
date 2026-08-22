@@ -19,8 +19,18 @@ from typing import Any
 
 import httpx
 
-_ENV_FILE = Path(__file__).with_name(".env.local")
-if _ENV_FILE.exists():
+# Searched for rather than computed, because the file sits at the project root
+# while this module lives inside the package, and an installed package may not
+# be under that root at all.
+_ENV_FILE = next(
+    (
+        candidate / ".env.local"
+        for candidate in (Path.cwd(), *Path.cwd().parents, *Path(__file__).resolve().parents)
+        if (candidate / ".env.local").is_file()
+    ),
+    None,
+)
+if _ENV_FILE is not None:
     from dotenv import load_dotenv
 
     load_dotenv(_ENV_FILE)
