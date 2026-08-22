@@ -27,6 +27,7 @@ remembering it.
 src/agent_runtime/    the runtime
 tests/                the three proof harnesses
 mock/                 the remotes it talks to, and the Postgres they run against
+tools/                checks CI runs against the code and these documents
 schema.sql            the tables the runtime's state and history live in
 ```
 

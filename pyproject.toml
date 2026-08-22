@@ -34,7 +34,9 @@ where = ["src"]
 
 [tool.pylint.main]
 # The tests reach for journal's private steps on purpose; see tests/fencetest.py.
-ignore-paths = []
+# node_modules is there because the mermaid packages tools/ installs for the
+# diagram check ship Python files of their own, which are nobody's business here.
+ignore-paths = [".*node_modules.*"]
 
 [tool.pylint.format]
 max-line-length = 100

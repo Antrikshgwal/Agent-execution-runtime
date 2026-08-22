@@ -1,0 +1,13 @@
+{
+  "name": "agent-runtime-doc-checks",
+  "private": true,
+  "type": "module",
+  "description": "Parser-only dependencies for tools/check_diagrams.mjs. Not part of the Python package.",
+  "scripts": {
+    "check": "node check_diagrams.mjs ../README.md ../ARCHITECTURE.md"
+  },
+  "dependencies": {
+    "jsdom": "^26.0.0",
+    "mermaid": "^11.4.0"
+  }
+}
