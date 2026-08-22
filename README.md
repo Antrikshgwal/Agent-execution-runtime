@@ -1,179 +1,110 @@
 # Agent-execution-runtime
 
-A durable agent runtime. It runs an agent loop and survives `kill -9` at any
-point, resuming without repeating an external action.
+An agent loop that survives `kill -9` and picks up where it left off.
 
-Two lines of the loop touch the outside world:
+## The problem
+
+An agent decides what to do, then does it. Both halves are expensive to repeat,
+and the process can die between them.
+
+Say the agent is provisioning infrastructure. It decides to create a server,
+sends the request, and the machine running it dies before the response arrives.
+On restart it faces a question its own database cannot answer: did that server
+get created? Send the request again and you may be paying for two. Assume it
+worked and the run carries on as though a server exists that might not.
+
+The call to the model has the same shape. Ask it twice about the same step and
+the second answer may differ, because nothing obliges a model to be consistent.
+Act on that second answer and every later step builds on a history that never
+happened, which is harder to spot than a duplicate server and worse to unpick.
+
+Neither problem yields to trying harder. The gap between acting and recording
+what happened cannot be closed, only made survivable.
+
+## The pattern
+
+Write the intention down before acting, and the outcome after:
 
 ```
-decision = LLM(goal, history)      # journaled, replayed on recovery
-result   = call_tool(decision)     # journaled, re-sent under the same key
+commit an intent row       about to act
+act                        call the model, or call the tool
+commit a confirm           this is what came back
 ```
 
-Both follow one pattern: commit an intent row, act, commit a confirm. A crash
-between the action and the confirm leaves a row whose outcome is unknown, and
-recovery resolves it. Tool calls get re-sent under their original idempotency
-key, so the remote answers `already_done` instead of acting twice. Journaled
-decisions get replayed, so the planner is never asked about a step it already
-decided.
+Both external calls go through it. A crash in between leaves a row saying an
+attempt was made without saying how it ended, which is the honest record of a
+window that cannot be closed. Resolving those rows is the first thing a restart
+does.
 
-## Layout
+Every fact needed to resume lives in Postgres, so a restart reads its state back
+rather than remembering it.
 
-```
-src/agent_runtime/    the runtime
-tests/                the two proof harnesses
-mock/                 the remotes it talks to, and the Postgres they run against
-schema.sql            the tables the runtime's state and history live in
-```
+## What that buys
 
-The import graph runs one way. `recovery` reaches for `executor` and `journal`,
-both reach for `tools` and `fencing`, and nothing reaches back.
+**An external action never happens twice.** Every tool call carries an
+idempotency key built from the run and the step number, like `run42:3`. A restart
+re-sends the stranded call under that same key, and the remote recognises it and
+hands back the result it stored the first time instead of doing the work again.
+One server, whatever the crash did.
 
-- `runtime.py` — the loop: claim the run, recover, then step until DONE
-- `journal.py` — decisions, replay, and what the planner cost
-- `executor.py` — one tool call, intent row first
-- `recovery.py` — what a crash left behind, settled on startup
-- `fencing.py` — claiming a run, and what happens to a worker that loses it
-- `tools.py` — the `@tool` decorator, the registry, and dispatch
-- `demo_tools.py` — the three tools the demo agent chooses among
-- `planner.py` — client for the planner
-- `crashpoints.py` — the seven points `CRASH_AT` can kill the process at
-- `config.py` — settings read from the environment
-- `logs.py` — the one-event-per-line output the tests assert on
+**A decided step is never bought from the model twice.** Decisions are committed
+before the runtime acts on them, so a restart replays the recorded decision
+instead of asking again. The saving is not the money. It is that the agent's
+history stays the one that actually happened.
 
-Under `tests/`:
+**Two workers on one run cannot both write.** A worker holds a number it got by
+claiming the run, and every write is conditioned on that number still being the
+current one. A worker that stalls long enough for another to take over is never
+told; it finds out when its next write is refused, which is early enough to have
+changed nothing.
 
-- `crashtest.py` — runs each crash point and asserts on what recovery produced
-- `fencetest.py` — presses each guarded write from both sides of a stolen run
+Each of the three has a test harness that fails when the guarantee is removed.
 
-## Run it
+## Try it
+
+Everything runs locally. The cloud provider and the model are both mock services
+in [`mock/`](mock/), so nothing is billed and nothing leaves the machine.
 
 ```bash
 pip install -e .
 ```
 
-Start Postgres and the mock cloud as described in `mock/README.md`, then pick a
-planner.
-
-**Scripted planner** (default). Free, deterministic, and what the crash tests
-use. Needs `mock_llm` running:
+Start Postgres and the two mocks as described in
+[`mock/README.md`](mock/README.md), then run the agent:
 
 ```bash
 python -m agent_runtime
 ```
 
-The install also puts an `agent-runtime` command on the path, which does the
-same thing.
+It provisions a server, a database, and a DNS record, then stops.
 
-**Gemini.** Needs the extra, and `GEMINI_API_KEY=...` in `.env.local`, which git
-ignores:
-
-```bash
-pip install -e ".[gemini]"
-PLANNER=gemini python -m agent_runtime
-```
-
-`GEMINI_MODEL` overrides the default `gemini-3.5-flash`. A real model makes
-replay more than a demonstration: ask it twice about the same step and the
-second answer may differ.
-
-Planner calls are counted in `journal_events.llm_attempts`, incremented before
-each call. Counting in the database rather than at the provider means the number
-survives `kill -9` and reflects money spent rather than answers received.
-
-## Crash tests
-
-`CRASH_AT` hard-kills the process at a named point with `os._exit(1)`, which
-skips the cleanup a real `kill -9` also skips. `CRASH_SEQ` chooses which step it
-dies on, so the kill can land on the first step or partway through a run.
-
-Points: `before_decide`, `after_decide_before_journal`, `after_decide`,
-`before_intent`, `after_intent`, `after_call`, `after_confirm`.
-
-`tests/crashtest.py` runs them. Each case kills a process at one point, restarts it,
-and checks what recovery produced against the mock cloud's key map, the mock
-planner's call counter, and all three tables:
+To watch it survive a crash, kill it at a named point and start it again on the
+same run:
 
 ```bash
-python tests/crashtest.py                 # every point, crashing on the first step
-python tests/crashtest.py --seq 2         # every point, crashing partway through
-python tests/crashtest.py after_call      # one point
+CRASH_AT=after_decide RUN_ID=demo python -m agent_runtime   # dies after deciding a step
+RUN_ID=demo python -m agent_runtime                         # picks the run back up
 ```
 
-Both mocks must stay up for the whole run. Restarting `mock_cloud` wipes the key
-map and restarting `mock_llm` resets the counter, and either one voids the
-result.
-
-Two of the seven cases are the proofs the design exists for:
-
-- **`after_call`** kills the process after the remote acted and before the
-  confirm committed. Recovery re-sends under the same key, the remote answers
-  `already_done`, the resource count does not move, and the stored result is the
-  id from before the crash.
-- **`after_decide`** kills it after the decision was journaled and before the
-  tool ran. The restart replays the decision, and the planner's counter holds
-  flat. A counter that ticks up means the runtime paid to re-think a step it had
-  already decided, which breaks the central claim even when the final state
-  happens to look right.
-
-To watch one by hand instead:
-
-```bash
-CRASH_AT=after_decide RUN_ID=demo python -m agent_runtime   # dies with a decision journaled
-RUN_ID=demo python -m agent_runtime                         # recovers
-```
-
-## Fencing
-
-A worker takes a run by incrementing `runs.epoch`, conditioned on the value it
-just read:
-
-```sql
-update runs
-   set epoch = epoch + 1, owner = $2, claimed_at = now()
- where run_id = $1 and epoch = $3
-returning epoch;
-```
-
-Postgres serializes two updates on the same row, so of two workers that read the
-same epoch exactly one finds its `where` clause still true. The other matches no
-rows and learns it lost before writing anything:
+The first process dies with a decision recorded and its tool not yet called. The
+second replays that decision instead of asking the model again, runs the tool
+once, and finishes:
 
 ```
-INFO  claimed  run=twow  epoch=1  owner=host-16676-4956fe
-INFO  fenced   run=twow  epoch=0  observed=1  write=claim
+INFO  decided   run=demo  seq=0  tool=create_server  args={"name": "srv-182", ...}  llm_calls=1
+!!! CRASH_AT=after_decide seq=0 -- os._exit(1)
+INFO  replayed  run=demo  seq=0  tool=create_server  args={"name": "srv-182", ...}  llm_calls=1
+INFO  done      run=demo  steps=3  llm_calls=4
 ```
 
-Every later write to `journal_events` and `side_effects` asks the same question,
-by looking at `runs.epoch` rather than at the epoch stamped on the row being
-written. The distinction is the whole point: recovery settles rows an earlier
-epoch stranded on every restart, so a worker comparing its epoch against the
-row's stamp would fence itself against its own crashed predecessor. Crash a run
-and restart it, and you can watch the new epoch adopt the old one's work:
+`llm_calls` holds at 1 across the restart, so the model was not asked about step
+0 twice. The name it chose is the same one, which is the same fact seen from the
+other side: the mock model writes its own call count into every name it picks, so
+a step that had been re-decided would say `srv-2` instead.
 
-```
-INFO  claimed    run=demo  epoch=2  owner=host-9488-4e4c61
-INFO  confirmed  run=demo  seq=0  key=demo:0  result=i-0000533  remote=already_done
-```
+## Where to look next
 
-A guarded write that matches nothing is not always a lost race, so the log says
-which it was. `fenced` means the run moved to another epoch. `stalled` means it
-did not, and the row was simply not in the state the write required.
-
-```bash
-python tests/fencetest.py
-```
-
-It bumps `runs.epoch` by hand to stand in for another worker's claim, then
-presses each guarded write from both sides. The new owner must settle what the
-old epoch left behind. Nobody else gets to write at all, including before the
-planner call that would otherwise be paid for.
-
-Needs Postgres. The mocks can stay down, since nothing there calls a tool.
-
-`runs.owner` and `runs.claimed_at` are written but nothing reads them. As
-recorded, `claimed_at` says when the claim happened, not when the owner was last
-alive, so deciding a claim is stale enough to steal would need the owner to
-heartbeat it. Claiming does not wait on a lease: a crashed worker leaves no
-signal that it died, so a restart has to be able to take its own run back, and
-fencing is what makes the previous owner harmless if it was only stalled.
+- [`ARCHITECTURE.md`](ARCHITECTURE.md) explains the modules, the three tables,
+  one step end to end, what each crash point leaves behind, how a stolen run
+  settles, and how to run the test harnesses.
+- [`mock/README.md`](mock/README.md) covers Postgres and the two mock remotes.
