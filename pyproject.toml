@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent-runtime"
+version = "0.7.0"
+description = "A durable agent loop that survives kill -9 without repeating an external action"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "asyncpg",
+    "httpx",
+    "pydantic",
+]
+
+[project.optional-dependencies]
+# PLANNER=gemini only. The scripted planner needs neither, and the crash tests
+# use the scripted one because a test that pays a provider and picks a different
+# plan each run proves nothing.
+gemini = [
+    "google-genai",
+    "python-dotenv",
+]
+dev = [
+    "pylint",
+]
+
+[project.scripts]
+agent-runtime = "agent_runtime.runtime:run_cli"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pylint.main]
+# The tests reach for journal's private steps on purpose; see tests/fencetest.py.
+ignore-paths = []
+
+[tool.pylint.format]
+max-line-length = 100
+
+[tool.pylint."messages control"]
+# demo_tools is imported for its registration side effect, and the loop needs it
+# imported before the planner is offered a tool list.
+disable = ["duplicate-code"]
