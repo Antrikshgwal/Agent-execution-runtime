@@ -26,7 +26,7 @@ from typing import NoReturn
 
 import asyncpg
 
-from logs import log
+from agent_runtime.logs import log
 
 
 def matched(tag: str) -> bool:

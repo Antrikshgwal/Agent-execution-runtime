@@ -7,28 +7,25 @@ follow the same three-step pattern: commit an intent row, act, commit a confirm.
 On restart the runtime replays journaled decisions instead of asking again, and
 re-sends stranded tool calls under their original keys.
 
-    runtime.py    this loop
-    journal.py    decisions, replay, and what the planner cost
-    executor.py   one tool call, intent-first
-    recovery.py   what a crash left behind
-    fencing.py    who owns the run, and what happens to everyone else
-    tools.py      the registry the loop dispatches through
+    runtime     this loop
+    journal     decisions, replay, and what the planner cost
+    executor    one tool call, intent-first
+    recovery    what a crash left behind
+    fencing     who owns the run, and what happens to everyone else
+    tools       the registry the loop dispatches through
 """
 
 import asyncio
 
 import asyncpg
 
-import config
-import crashpoints
-import demo_tools  # noqa: F401  (importing registers the demo tools)
-import executor
-import fencing
-import planner
-import recovery
-import tools
-from journal import decide_step, llm_calls
-from logs import log
+from agent_runtime import config, crashpoints, executor, fencing, planner, recovery, tools
+from agent_runtime.journal import decide_step, llm_calls
+from agent_runtime.logs import log
+
+# Imported for the side effect: the @tool decorator puts the demo tools in the
+# registry before the loop offers the planner anything to choose from.
+from agent_runtime import demo_tools  # pylint: disable=unused-import
 
 
 async def finish(conn: asyncpg.Connection, run_id: str, epoch: int, status: str) -> None:
@@ -92,5 +89,10 @@ async def main() -> None:
         await conn.close()
 
 
-if __name__ == "__main__":
+def run_cli() -> None:
+    """Console-script entry point, for the `agent-runtime` command."""
     asyncio.run(main())
+
+
+if __name__ == "__main__":
+    run_cli()

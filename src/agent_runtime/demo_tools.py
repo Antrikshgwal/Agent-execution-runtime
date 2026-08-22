@@ -7,7 +7,7 @@ choices make the journal worth replaying.
 All three hit the same mock service. Importing this module registers them.
 """
 
-from tools import ToolContext, tool
+from agent_runtime.tools import ToolContext, tool
 
 
 @tool

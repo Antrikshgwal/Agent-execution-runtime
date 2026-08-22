@@ -30,16 +30,14 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass
-from pathlib import Path
 
 import asyncpg
 import httpx
 
-import config
-from crashpoints import POINTS
-from logs import banner, line
+from agent_runtime import config
+from agent_runtime.crashpoints import POINTS
+from agent_runtime.logs import banner, line
 
-HERE = Path(__file__).parent
 MOCK_CLOUD_URL = os.environ.get("MOCK_CLOUD_URL", "http://localhost:9000")
 MOCK_LLM_URL = os.environ.get("MOCK_LLM_URL", "http://localhost:9100")
 
@@ -167,15 +165,18 @@ async def remote_keys() -> dict[str, str]:
 
 
 def spawn(run_id: str, crash_at: str | None, crash_seq: int) -> subprocess.CompletedProcess:
-    """One agent process. Blocking on purpose: the point is that it dies."""
+    """One agent process. Blocking on purpose: the point is that it dies.
+
+    Launched as `-m agent_runtime`, so the module being killed is the one a
+    person runs rather than a copy reachable only from a particular directory.
+    """
     env = dict(os.environ, RUN_ID=run_id, PLANNER="mock", CRASH_SEQ=str(crash_seq))
     if crash_at:
         env["CRASH_AT"] = crash_at
     else:
         env.pop("CRASH_AT", None)
     return subprocess.run(
-        [sys.executable, "runtime.py"],
-        cwd=HERE,
+        [sys.executable, "-m", "agent_runtime"],
         env=env,
         capture_output=True,
         text=True,
