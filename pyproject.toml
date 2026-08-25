@@ -28,6 +28,7 @@ dev = [
 
 [project.scripts]
 agent-runtime = "agent_runtime.runtime:run_cli"
+agent-supervisor = "agent_runtime.supervisor:run_cli"
 
 [tool.setuptools.packages.find]
 where = ["src"]

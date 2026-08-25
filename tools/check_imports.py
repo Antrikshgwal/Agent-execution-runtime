@@ -32,7 +32,11 @@ LAYERS: dict[str, int] = {
     "journal": 2,
     "executor": 2,
     "recovery": 3,
+    # Two entry points, each owning a process. The supervisor reaches the runtime
+    # by spawning it rather than importing it, so there is no edge between them
+    # and sharing a layer costs nothing.
     "runtime": 4,
+    "supervisor": 4,
     "__init__": 5,
     "__main__": 5,
 }
