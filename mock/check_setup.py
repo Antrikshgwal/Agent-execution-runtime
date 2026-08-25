@@ -1,8 +1,12 @@
 """Preflight check for the demo environment.
 
-Verifies the two things a run depends on before anything else is attempted: the
-Postgres schema is present, and the mock cloud service honours idempotency keys.
-Prints SETUP OK or a list of what is wrong, and exits non-zero on failure.
+Verifies the three things a run depends on before anything else is attempted:
+the Postgres schema is present, the mock cloud honours idempotency keys, and the
+mock planner is answering. Prints SETUP OK or a list of what is wrong, and exits
+non-zero on failure.
+
+It checks and does not start. The mocks are meant to run in the foreground where
+their logs are in front of you, so what starts them is you.
 """
 
 import asyncio
@@ -13,6 +17,7 @@ import httpx
 
 DATABASE_URL = "postgresql://durable:durable@localhost:5433/durable"
 MOCK_CLOUD_URL = "http://localhost:9000"
+MOCK_LLM_URL = "http://localhost:9100"
 
 
 async def check_tables_exist(conn: asyncpg.Connection) -> list[str]:
@@ -56,6 +61,22 @@ async def check_idempotent_provision() -> list[str]:
     return failures
 
 
+async def check_planner_answering() -> list[str]:
+    """Ask the planner for its call count, which every mock_llm serves.
+
+    Nothing here decides a step. A run that gets this far and then finds the
+    planner down fails on its first decision, which is a worse place to learn it.
+    """
+    async with httpx.AsyncClient() as client:
+        response = await client.get(f"{MOCK_LLM_URL}/calls")
+
+    if response.status_code != 200:
+        return [f"mock planner answered /calls with HTTP {response.status_code}"]
+    if "calls" not in response.json():
+        return [f"mock planner answered /calls without a count: {response.text}"]
+    return []
+
+
 async def main() -> None:
     """Run every check and report the combined result."""
     failures = []
@@ -76,6 +97,11 @@ async def main() -> None:
         failures += await check_idempotent_provision()
     except Exception as exc:  # pylint: disable=broad-exception-caught
         failures.append(f"could not reach mock cloud service: {exc}")
+
+    try:
+        failures += await check_planner_answering()
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        failures.append(f"could not reach mock planner: {exc}")
 
     if failures:
         print("SETUP FAILED:")
