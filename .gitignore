@@ -19,3 +19,5 @@ specs.md
 
 # Node, for the doc checks in tools/
 node_modules/
+
+demo.py
