@@ -10,12 +10,19 @@ a real model may return something else, and the journal would then describe a
 history that never happened.
 """
 
+import os
+import time
 from typing import Any
 
 from fastapi import FastAPI
 from pydantic import BaseModel
 
 app = FastAPI()
+
+# Seconds to think for before answering. Zero by default, so the crash tests stay
+# quick. Set MOCK_DELAY=5 to give yourself a window to kill the agent by hand
+# mid-decision, the way a real model's latency would.
+DELAY = float(os.environ.get("MOCK_DELAY", "0"))
 
 state: dict[str, int] = {"calls": 0}
 
@@ -34,6 +41,12 @@ def decide(req: DecideRequest):
     state["calls"] += 1
     call = state["calls"]
     step = len(req.history)
+
+    # Counted first, then the thinking. A caller killed during the delay has
+    # already been charged for the call, which is what a real provider does and
+    # what the runtime's own llm_attempts counter is written to match.
+    if DELAY:
+        time.sleep(DELAY)
 
     if step == 0:
         return {
