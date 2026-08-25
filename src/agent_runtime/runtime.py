@@ -84,7 +84,8 @@ async def main() -> None:
     try:
         log("registry", tools=",".join(tools.REGISTRY), planner=planner.BACKEND)
         epoch = await fencing.claim(conn, config.RUN_ID, config.GOAL, config.WORKER)
-        await run(conn, config.RUN_ID, epoch)
+        async with fencing.heartbeat(config.RUN_ID, epoch):
+            await run(conn, config.RUN_ID, epoch)
     finally:
         await conn.close()
 

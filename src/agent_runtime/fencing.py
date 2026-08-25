@@ -22,10 +22,13 @@ in the state the write required. Both are fatal, and `superseded` tells them
 apart by reading the live epoch back.
 """
 
-from typing import NoReturn
+import asyncio
+import contextlib
+from typing import AsyncIterator, NoReturn
 
 import asyncpg
 
+from agent_runtime import config
 from agent_runtime.logs import log
 
 
@@ -101,6 +104,49 @@ async def claim(conn: asyncpg.Connection, run_id: str, goal: str, owner: str) ->
 
     log("claimed", run=run_id, epoch=epoch, owner=owner)
     return epoch
+
+
+async def _beat(conn: asyncpg.Connection, run_id: str, epoch: int) -> None:
+    """Refresh claimed_at until this worker stops owning the run.
+
+    Guarded like every other write, so a superseded worker cannot keep a claim
+    warm that it has already lost. Losing the guard ends the beat quietly: the
+    worker's next real write is what stops it, and killing the process from a
+    background task here would race that with no benefit.
+    """
+    while True:
+        await asyncio.sleep(config.HEARTBEAT_SECONDS)
+        tag = await conn.execute(
+            "update runs set claimed_at = now() where run_id = $1 and epoch = $2",
+            run_id,
+            epoch,
+        )
+        if not matched(tag):
+            log("heartbeat-lost", run=run_id, epoch=epoch)
+            return
+
+
+@contextlib.asynccontextmanager
+async def heartbeat(run_id: str, epoch: int) -> AsyncIterator[None]:
+    """Keep this worker's claim visibly alive for as long as the body runs.
+
+    A stopped heartbeat is how anything else learns the worker is gone. Nothing
+    the worker writes says 'still here', and a crash writes nothing at all, so a
+    run that dies mid-step would otherwise sit at `running` forever, looking
+    exactly like one being worked on.
+
+    The beat gets its own connection. asyncpg gives no protection against two
+    coroutines using one connection at once, and the loop is busy on its own.
+    """
+    conn = await asyncpg.connect(config.DATABASE_URL)
+    task = asyncio.create_task(_beat(conn, run_id, epoch))
+    try:
+        yield
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+        await conn.close()
 
 
 async def superseded(
