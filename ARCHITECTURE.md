@@ -26,9 +26,11 @@ remembering it.
 ```
 src/agent_runtime/    the runtime
 tests/                the three proof harnesses
-mock/                 the remotes it talks to, and the Postgres they run against
+mock/                 the two remotes it talks to
 tools/                checks CI runs against the code and these documents
 schema.sql            the tables the runtime's state and history live in
+docker-compose.yml    the Postgres those tables live in
+demo.py               a narrated walkthrough of a crash and a recovery
 ```
 
 `pip install -e .` puts an `agent-runtime` command on the path. It calls
@@ -51,11 +53,16 @@ flowchart TB
     pg[("Postgres")]
     cloud[/"tool remote"/]
 
+    sup["supervisor<br/>resume what stopped beating"]
+
     rt --> rec
     rt --> jr
     rt --> ex
     rt --> fn
     rec --> ex
+
+    sup -. spawns .-> rt
+    sup -- reads claimed_at --> pg
 
     jr --> pl
     jr --> fn
@@ -83,6 +90,7 @@ write a row without asking `fencing` whether this worker still owns the run, and
 | [tools.py](src/agent_runtime/tools.py) | registration, validation, dispatch |
 | [demo_tools.py](src/agent_runtime/demo_tools.py) | the three tools the demo agent chooses among |
 | [planner.py](src/agent_runtime/planner.py) | the scripted backend and the Gemini one |
+| [supervisor.py](src/agent_runtime/supervisor.py) | noticing a run whose worker stopped, and starting another |
 | [crashpoints.py](src/agent_runtime/crashpoints.py) | the seven points `CRASH_AT` and `STALL_AT` inject at |
 | [config.py](src/agent_runtime/config.py) | settings read from the environment |
 | [logs.py](src/agent_runtime/logs.py) | the one-event-per-line output the tests assert on |
@@ -101,6 +109,12 @@ Three tables, all in Postgres, defined in [schema.sql](schema.sql):
 | `runs` | run | `status`, `epoch`, `owner` |
 | `journal_events` | step | `seq`, `event_type`, `payload`, `status`, `epoch`, `llm_attempts` |
 | `side_effects` | tool call | `idempotency_key`, `tool_name`, `tool_args`, `status`, `result`, `epoch` |
+
+`runs.status` is `running`, `done`, or `failed`, and only the loop's last act
+writes a terminal one. A process that dies never gets there, so `running` means
+*claimed and never finished* rather than *being worked on*. Nothing can tell
+those apart from the status alone, which is what `claimed_at` and the heartbeat
+below are for.
 
 `runs.epoch` decides who may write. The `epoch` column on the two child tables
 records who last wrote each row, which is history rather than permission.
@@ -328,10 +342,90 @@ INFO  claimed    run=demo  epoch=2  owner=host-9488-4e4c61
 INFO  confirmed  run=demo  seq=0  key=demo:0  result=i-0000533  remote=already_done
 ```
 
-`runs.owner` and `runs.claimed_at` are written but nothing reads them. As
-recorded, `claimed_at` says when the claim happened, not when the owner was last
-alive, so deciding that a claim is stale enough to steal would need the owner to
-heartbeat it.
+`runs.owner` is written and read by nobody. `epoch` decides who may write; owner
+only says which process to go and look at.
+
+## Liveness
+
+Everything above makes a run resume *correctly* when a worker is started on it.
+Nothing above notices that one should be. A worker that dies leaves `status` at
+`running` and stops writing, and that row is indistinguishable from a run being
+worked on right now. Left alone it stays that way for good.
+
+Two pieces close it. A heartbeat makes the difference observable, and a
+supervisor acts on it.
+
+### The heartbeat
+
+`fencing.heartbeat` wraps the loop and refreshes `claimed_at` every
+`HEARTBEAT_SECONDS` while the worker holds the run:
+
+```sql
+update runs set claimed_at = now() where run_id = $1 and epoch = $2;
+```
+
+Guarded like every other write, so a worker that has already lost the run cannot
+keep its claim looking warm. When that guard stops matching, the beat stops. It
+does not kill the process: the worker's next real write will fence it, and
+racing that from a background task buys nothing.
+
+It runs on its own connection. asyncpg offers no protection against two
+coroutines using one connection at once, and the loop is busy with its own
+queries.
+
+With this in place `claimed_at` means *the owner was alive at this moment*,
+which is what makes the next part possible. Without it the column only records
+when a claim happened, and a run abandoned an hour ago reads exactly like one
+mid-step.
+
+### The supervisor
+
+```mermaid
+flowchart TB
+    P{"poll every<br/>POLL_SECONDS"} --> Q["runs where status = 'running'<br/>and claimed_at older than LEASE_SECONDS"]
+    Q --> D{"already minding<br/>this run?"}
+    D -->|yes| P
+    D -->|no| S["spawn python -m agent_runtime<br/>with RUN_ID set"]
+    S --> W["worker claims, recovers, finishes"]
+    W --> P
+```
+
+A run still at `running` whose heartbeat has gone stale had a worker and no
+longer does. `supervisor.py` polls for exactly that and starts a fresh process
+on each one.
+
+It queries for the condition rather than watching for the event, so it finds
+runs abandoned before it was started. A supervisor brought up after a power cut
+drains the backlog on its first sweep.
+
+Workers are spawned rather than run in-process. A worker that loses its claim
+exits, which is right for something that owns one run and wrong for something
+minding several, and a crash in one run must not take the supervisor with it.
+Spawning also means the thing being supervised is the same `python -m
+agent_runtime` a person runs.
+
+Starting a worker on a run that turns out to be alive needs no locking. Both
+claim, the compare-and-swap picks one, and the older epoch is fenced at its next
+write. The lease decides only when a run is worth trying.
+
+### Why the lease does not gate the claim
+
+`claim` never waits on `LEASE_SECONDS`. A worker restarting after its own crash
+would otherwise be unable to take back the run it just died holding until the
+lease expired, which would put that delay in front of every manual restart and
+every crash test. Staleness decides which runs get picked up. The
+compare-and-swap decides who owns one, and fencing makes the answer safe.
+
+The cost of a crash is therefore bounded by `LEASE_SECONDS + POLL_SECONDS`
+before anyone notices, and nothing after that.
+
+### What is not supervised
+
+The supervisor is a process, and nothing here restarts it. That belongs to
+whatever already keeps processes alive: systemd, a Docker restart policy, a
+Kubernetes deployment. A run heals itself as long as one supervisor is alive
+somewhere, and keeping it alive is the platform's job rather than this
+repository's.
 
 ## Tools
 
@@ -388,7 +482,15 @@ the runtime, and a retry hidden in the client would defeat it.
 | `PLANNER` | `mock` | `mock` or `gemini` |
 | `MAX_STEPS` | 12, in code | guard against a planner that never says DONE |
 | `WORKER` | host, pid, and a random suffix | written to `runs.owner`, diagnostic only |
+| `HEARTBEAT_SECONDS` | 3 | how often a worker refreshes `claimed_at` while it holds a run |
+| `LEASE_SECONDS` | 12 | how stale `claimed_at` may get before the supervisor calls the run abandoned |
+| `POLL_SECONDS` | 3 | how often the supervisor looks |
 | `CRASH_AT`, `STALL_AT`, `CRASH_SEQ`, `STALL_MS` | unset | fault injection, above |
+| `MOCK_DELAY` | 0 | seconds each mock holds a response open, for killing a worker by hand |
+
+`LEASE_SECONDS` is four heartbeats, so one slow beat does not cost a live worker
+its run. Lower both to shorten the window a dead run waits in, at the price of
+more heartbeat writes and less slack.
 
 Planner calls are counted in `journal_events.llm_attempts`. Counting in the
 database rather than at the provider means the number survives `kill -9` and
@@ -425,6 +527,17 @@ claimed.
 | `stalled` | A guarded write matched no rows and the run did not move | `epoch`, `observed`, `write` |
 | `guard` | `MAX_STEPS` is reached without a DONE | `reason` |
 | `done` | The agent decides DONE | `steps`, `llm_calls` |
+| `heartbeat-lost` | The heartbeat's guarded write stopped matching, so the run changed hands | `epoch` |
+
+The supervisor is a separate process and logs its own, without a `run` field on
+the first two:
+
+| Event | When | Fields |
+| --- | --- | --- |
+| `supervisor` | At startup | `lease`, `poll`, `heartbeat` |
+| `resuming` | A worker is spawned for an abandoned run | `run`, `pid` |
+| `worker-exited` | That worker finished | `run`, `code` |
+| `supervisor-stopping` | Interrupted | `minding` |
 
 `remote` is `created` or `already_done`, which is how the tool proof reads off
 the log. Every decision-related event echoes `llm_calls`, so the flat-counter
@@ -545,3 +658,12 @@ The tests exist to hold these down:
 5. History comes out of the database, not out of memory.
 6. Planner spend increments before the call, so a crash mid-call still records it.
 7. The runtime never branches on a tool's name and never reads its arguments.
+8. A worker refreshes `claimed_at` for as long as it holds a run, and stops the
+   moment it does not, so a run nobody is working on can be told from one
+   somebody is.
+
+The last of those has no harness. The heartbeat and the supervisor were checked
+by hand: kill a worker mid-call, leave it alone, and the run reaches `done` with
+one resource per key. Everything else on this list fails a named test when the
+guarantee is removed, and that one does not yet.
+
