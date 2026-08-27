@@ -73,8 +73,6 @@ whatever is sitting there.
 The supervisor is a process, and nothing here restarts it. That job belongs to
 whatever already keeps processes alive on your machine.
 
-## Demo
-
 ## Try it yourself
 
 Everything runs locally. The cloud provider and the model are both mock services
