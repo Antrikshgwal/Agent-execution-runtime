@@ -459,7 +459,6 @@ async def main() -> None:
     parser.add_argument(
         "points",
         nargs="*",
-        choices=POINTS,
         metavar="POINT",
         help=f"which points to run (default: all). One of: {', '.join(POINTS)}",
     )
@@ -471,6 +470,13 @@ async def main() -> None:
         " leaves the restart with settled work behind it as well as ahead of it.",
     )
     args = parser.parse_args()
+
+    invalid = [point for point in args.points if point not in POINTS]
+    if invalid:
+        parser.error(
+            "argument POINT: invalid choice: "
+            f"{invalid[0]!r} (choose from {', '.join(repr(point) for point in POINTS)})"
+        )
 
     if not 0 <= args.seq < TOOL_STEPS:
         parser.error(f"--seq must be 0..{TOOL_STEPS - 1}: only those steps make a tool call")
