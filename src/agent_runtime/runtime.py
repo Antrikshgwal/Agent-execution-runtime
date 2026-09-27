@@ -45,7 +45,7 @@ async def finish(conn: asyncpg.Connection, run_id: str, epoch: int, status: str)
         await fencing.superseded(conn, run_id, epoch, f"finish as {status}")
 
 
-async def run(conn: asyncpg.Connection, run_id: str, epoch: int) -> None:
+async def run(conn: asyncpg.Connection, run_id: str, goal: str, epoch: int) -> None:
     """Settle what a crash left behind, then step until the agent is done."""
     outcome = await recovery.recover(conn, run_id, epoch)
 
@@ -59,7 +59,7 @@ async def run(conn: asyncpg.Connection, run_id: str, epoch: int) -> None:
             await finish(conn, run_id, epoch, "failed")
             return
 
-        decision = await decide_step(conn, run_id, seq, epoch)
+        decision = await decide_step(conn, run_id, seq, goal, epoch)
 
         if decision.get("done"):
             await finish(conn, run_id, epoch, "done")
@@ -83,9 +83,14 @@ async def main() -> None:
     conn = await asyncpg.connect(config.DATABASE_URL)
     try:
         log("registry", tools=",".join(tools.REGISTRY), planner=planner.BACKEND)
-        epoch = await fencing.claim(conn, config.RUN_ID, config.GOAL, config.WORKER)
+        # config.GOAL only seeds a run that does not exist yet. What comes back
+        # is the goal the run itself carries, which is what the planner is asked
+        # about for the rest of this worker's life.
+        epoch, goal = await fencing.claim(
+            conn, config.RUN_ID, config.GOAL, config.WORKER
+        )
         async with fencing.heartbeat(config.RUN_ID, epoch):
-            await run(conn, config.RUN_ID, epoch)
+            await run(conn, config.RUN_ID, goal, epoch)
     finally:
         await conn.close()
 

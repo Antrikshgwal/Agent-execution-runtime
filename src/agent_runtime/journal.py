@@ -10,7 +10,7 @@ from typing import Any
 
 import asyncpg
 
-from agent_runtime import config, fencing, planner, tools
+from agent_runtime import fencing, planner, tools
 from agent_runtime.crashpoints import interrupt
 from agent_runtime.logs import log
 
@@ -141,9 +141,15 @@ async def _confirm_step(
 
 
 async def decide_step(
-    conn: asyncpg.Connection, run_id: str, seq: int, epoch: int
+    conn: asyncpg.Connection, run_id: str, seq: int, goal: str, epoch: int
 ) -> dict[str, Any]:
-    """Return this step's decision, replaying it when the journal holds one."""
+    """Return this step's decision, replaying it when the journal holds one.
+
+    The goal arrives from the run's own row by way of the claim, rather than
+    from this process's environment. A worker started on someone else's run
+    inherits whatever `GOAL` its parent was given, and planning against that
+    would produce a history that is coherent, recorded, and about the wrong job.
+    """
     row = await conn.fetchrow(
         "select payload, status from journal_events where run_id = $1 and seq = $2",
         run_id,
@@ -175,7 +181,7 @@ async def decide_step(
     log("deciding", run=run_id, seq=seq, llm_calls=await llm_calls(conn, run_id))
 
     history = await load_history(conn, run_id)
-    decision = await planner.decide(config.GOAL, history, tools.schemas_for_model())
+    decision = await planner.decide(goal, history, tools.schemas_for_model())
 
     interrupt("after_decide_before_journal")
 

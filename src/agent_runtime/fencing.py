@@ -50,8 +50,11 @@ async def current_epoch(conn: asyncpg.Connection, run_id: str) -> int | None:
     return await conn.fetchval("select epoch from runs where run_id = $1", run_id)
 
 
-async def claim(conn: asyncpg.Connection, run_id: str, goal: str, owner: str) -> int:
-    """Take the run, and return the epoch that guards every write that follows.
+async def claim(
+    conn: asyncpg.Connection, run_id: str, goal: str, owner: str
+) -> tuple[int, str]:
+    """Take the run, and return the epoch that guards every write that follows,
+    along with the goal the run is actually working toward.
 
     Read the epoch, then bump it conditioned on the value read. Postgres
     serializes two updates on the same row, so of two workers that read the same
@@ -73,7 +76,8 @@ async def claim(conn: asyncpg.Connection, run_id: str, goal: str, owner: str) ->
     """
     await conn.execute(
         # The goal is fixed for the life of the run, since replay depends on it
-        # not changing. A resumed run keeps the one it was created with.
+        # not changing. A resumed run keeps the one it was created with, so this
+        # insert seeds a new run and leaves an existing one's goal alone.
         """
         insert into runs (run_id, goal, status) values ($1, $2, 'running')
         on conflict (run_id) do nothing
@@ -86,24 +90,28 @@ async def claim(conn: asyncpg.Connection, run_id: str, goal: str, owner: str) ->
     if observed is None:
         raise RuntimeError(f"run {run_id} vanished between its insert and its read")
 
-    epoch = await conn.fetchval(
+    # The goal comes back from the row rather than from the caller. A worker
+    # resuming someone else's run is handed the goal that run was created with,
+    # never whatever its own environment happens to say, and a planner asked
+    # about the wrong goal would answer coherently about work nobody wanted.
+    claimed = await conn.fetchrow(
         """
         update runs
            set epoch = epoch + 1, owner = $2, claimed_at = now()
          where run_id = $1 and epoch = $3
-        returning epoch
+        returning epoch, goal
         """,
         run_id,
         owner,
         observed,
     )
-    if epoch is None:
+    if claimed is None:
         # Someone claimed between the read and the bump. Report it the same way
         # as any other write that matched no rows, because that is what it is.
         await superseded(conn, run_id, observed, "claim")
 
-    log("claimed", run=run_id, epoch=epoch, owner=owner)
-    return epoch
+    log("claimed", run=run_id, epoch=claimed["epoch"], owner=owner)
+    return claimed["epoch"], claimed["goal"]
 
 
 async def _beat(conn: asyncpg.Connection, run_id: str, epoch: int) -> None:
